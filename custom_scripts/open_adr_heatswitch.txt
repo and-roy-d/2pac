@@ -1,3 +1,0 @@
-# Open ADR Heat Switch
-open heatswitch adr
-return wait_forever

@@ -1,3 +1,0 @@
-# Idle Wait Forever State
-while True:
-    world.wait(1)

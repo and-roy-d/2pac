@@ -2,7 +2,7 @@
 # 0. Close green valve check
 print("CLOSE THE GREEN HE3 VALVE")
 
-# 1. Close heatswitches pot & adr, open charcoal, wait until pot < 3.2K
+# 1. Close heatswitches pot & adr, open charcoal, wait until 3K starting temp < 3.2K
 close heatswitch pot
 wait 1 s
 close heatswitch adr
@@ -23,6 +23,8 @@ world.station.cryocon.loop1_setpoint(65)
 world.wait(1)
 world.station.cryocon.loop2_source("B")
 world.wait(1)
+world.station.cryocon.loop2_range("HI")
+world.wait(1)
 world.station.cryocon.loop2_setpoint(55)
 world.wait(1)
 world.station.cryocon.control_enabled(True)
@@ -38,45 +40,46 @@ ramp_controller.range("100uA")
 world.wait(1)
 
 target_hout = 58.1
-target_time_s = 1800
-target_step_duration_s = 1
-target_N_steps = int(target_time_s / target_step_duration_s)
-step_size = target_hout / target_N_steps
-houts_up = np.arange(target_N_steps) * step_size
-for hout in houts_up:
-    ramp_controller.out(hout)
-    world.wait(target_step_duration_s)
+target_time_s = 2700 # 45 min
+t_start_ramp = time.time()
+while True:
+    elapsed = time.time() - t_start_ramp
+    fraction = min(1.0, elapsed / target_time_s)
+    ramp_controller.out(fraction * target_hout)
+    if fraction >= 1.0:
+        break
+    world.wait(1)
 
 # 4. Wait for He3 to condense
 world.wait(12600)
 
-# 5. Cool charcoal
+# 5. Cool charcoal to launch temperature (< 1.0 K)
 open heatswitch pot
 world.wait(1)
 world.station.cryocon.control_enabled(False)
 world.wait(120)
 close heatswitch charcoal
 world.wait(1)
-world.wait(3600)
 
-world.station.cryocon.loop1_setpoint(65)
-world.wait(1)
-world.station.cryocon.loop2_source("B")
-world.wait(1)
-world.station.cryocon.loop2_setpoint(1)
-world.wait(1)
-world.station.cryocon.control_enabled(True)
-world.wait(1800)
-world.station.cryocon.control_enabled(False)
-world.wait(7200)
+while True:
+    mr = most_recent_measurements()
+    if mr.get("faa_temperature", 100) < 1.0:
+        break
+    world.wait(1)
 
 # 6. Ramp down ADR
 open heatswitch adr
 world.wait(1)
-houts_down = houts_up[::-1]
-for hout in houts_down:
-    ramp_controller.out(hout)
-    world.wait(target_step_duration_s)
+world.wait(600) # 10 min launch settle after opening ADR switch before ramp down
+t_start_down = time.time()
+target_down_time_s = 2700 # 45 min
+while True:
+    elapsed = time.time() - t_start_down
+    fraction = min(1.0, elapsed / target_down_time_s)
+    ramp_controller.out((1.0 - fraction) * target_hout)
+    if fraction >= 1.0:
+        break
+    world.wait(1)
 
 world.wait(1200)
 set relay CONTROL

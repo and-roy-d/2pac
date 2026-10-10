@@ -1,3 +1,0 @@
-# Open Pot Heat Switch
-open heatswitch pot
-return wait_forever

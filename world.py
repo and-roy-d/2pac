@@ -7,7 +7,17 @@ from imperative_statemachine import state, State
 from typing import Callable, Union, Any
 import random
 import numpy as np
-from nonblocking_readline import nonblocking_readline
+import sys
+import select
+
+def nonblocking_readline():
+    """Non-blocking read of a single line from sys.stdin."""
+    try:
+        if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.readline()
+    except Exception:
+        pass
+    return None
 
 # how to compile function from text
 # https://stackoverflow.com/questions/32429154/how-to-compile-a-function-at-run-time
@@ -163,81 +173,3 @@ class World:
         tstart = self.last_update_time_s
         for (state, line_number) in runner:
             elapsed = self.last_update_time_s-tstart
-            print(f"state={state.name()} {line_number=} {elapsed=:.2f} state_elapsed_s={self.state_elapsed_s():.2f}")
-            print(state.code_highlighted(line_number))
-            # print(f"I={self.current_A:.2f} V={self.voltage_V:.2f}")
-
-
-
-@dataclass 
-class FakeAdrWorld(World):
-    current_A: float = 0
-    voltage_V: float = 0
-    inductance_H: float = 1
-    resistance_Ohm: float = 0.2
-
-    def update_with_elapsed(self, elapsed_s):
-        # v = l*didt
-        didt = (self.voltage_V-self.current_A*self.resistance_Ohm)/self.inductance_H
-        # print(f"{elapsed_s=:.2f} {didt=:.4f} {self.current_A*self.resistance_Ohm=:.4f}")
-
-        self.current_A += didt*elapsed_s
-
-    def set_voltage(self, v):
-        self.voltage_V=v
-    
-
-
-@state
-def zero_current(world: FakeAdrWorld):
-    world.wait(seconds=5)
-    return ramp_up
-
-@state 
-def ramp_up(world: FakeAdrWorld):
-    target_voltage = 2
-    target_time_s = 20
-    target_step_duration_s = 1
-    target_N_steps = int(target_time_s/target_step_duration_s)
-    step_size = target_voltage/target_N_steps
-    for i in range(target_N_steps):
-        world.set_voltage(step_size*(i+1))
-        world.wait(seconds=target_step_duration_s)
-    return soak
-
-@state
-def soak(world: FakeAdrWorld):
-    world.wait(20)
-    return ramp_down
-
-@state
-def ramp_down(world: FakeAdrWorld):
-    Vstart = world.voltage_V
-    target_time_s = 20
-    max_voltage = 2
-    target_step_duration_s = 1
-    target_N_steps = int(target_time_s/target_step_duration_s)
-    step_size = -np.sign(Vstart)*Vstart/target_N_steps
-    volts = np.arange(Vstart, step_size, step_size)
-    for v in volts:
-        world.set_voltage(v)
-        world.wait(target_step_duration_s)
-    return chill_after_ramp_down
-
-@state
-def chill_after_ramp_down(world: FakeAdrWorld):
-    world.wait(10)
-    return
-
-if __name__ == "__main__":
-    world = FakeAdrWorld()
-    result = world.run_state(zero_current)
-    print(result)
-
-
-# features to add
-# 1. world argument DONE
-# 2. world.wait(seconds=) DONE
-# 3. world.wait_for_input_or_time(message, seconds)
-# 4. adr-ish demo DONE
-# 5. duck db data log

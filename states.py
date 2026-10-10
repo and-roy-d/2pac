@@ -5,8 +5,7 @@ import typing
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
-from imperative_statemachine import state
-from world import World
+from engine import state, World
 
 # Initialize globals to be populated by main.py
 st = None
@@ -52,12 +51,35 @@ def retry(f, n=3):
     return np.nan
 
 def update(datasaver, state):
-    parameters = [elapsed_time, st.cryocon.chA_temperature, st.cryocon.chB_temperature,
-                  st.cryocon.chC_temperature, st.cryocon.chD_temperature, st.labjack.kepco_current, st.labjack.kepco_voltage, st.ls370.heater.out,
-                  st.labjack.relay, st.labjack.heatswitch_adr, st.labjack.heatswitch_charcoal, st.labjack.heatswitch_pot,
-                  st.labjack.he3_pressure, st.labjack.vac_can_pressure_torr]
-    faa_val = retry(st.ls370.ch04.temperature, n=2)
-    l = [(param, retry(param, n=1)) for param in parameters] + [
+    ls370_out = retry(st.ls370.heater.out, n=1) if hasattr(st, "ls370") and st.ls370 is not None else np.nan
+    faa_val = retry(st.ls370.ch04.temperature, n=2) if hasattr(st, "ls370") and st.ls370 is not None else np.nan
+
+    # Auto-resync guard: detect if LS370 heater output (%) and FAA temperature (K) were swapped by serial FIFO collision
+    if np.isfinite(faa_val) and np.isfinite(ls370_out):
+        if faa_val > 20.0 and ls370_out < 2.0:
+            faa_val, ls370_out = ls370_out, faa_val
+            try:
+                if hasattr(st, "ls370") and hasattr(st.ls370, "visa_handle"):
+                    vh = st.ls370.visa_handle
+                    if hasattr(vh, "flush"):
+                        import pyvisa.constants as pv_const
+                        vh.flush(pv_const.VI_READ_BUF_DISCARD)
+                    elif hasattr(vh, "read_raw"):
+                        vh.read_raw()
+                    elif hasattr(vh, "read"):
+                        vh.read()
+            except Exception:
+                pass
+
+    cryo_params = [elapsed_time, st.cryocon.chA_temperature, st.cryocon.chB_temperature,
+                   st.cryocon.chC_temperature, st.cryocon.chD_temperature,
+                   st.labjack.kepco_current, st.labjack.kepco_voltage]
+    lj_params = [st.labjack.relay, st.labjack.heatswitch_adr, st.labjack.heatswitch_charcoal,
+                 st.labjack.heatswitch_pot, st.labjack.he3_pressure, st.labjack.vac_can_pressure_torr]
+
+    l = [(param, retry(param, n=1)) for param in cryo_params] + [
+        (st.ls370.heater.out, ls370_out),
+    ] + [(param, retry(param, n=1)) for param in lj_params] + [
         ("state", state.name()),
         ("faa_temperature", faa_val),
         ("time", time.time())
@@ -93,7 +115,55 @@ def pretty_str_dict(d: dict):
         s+= f"{key} {value}\n"
     return s
 
-# Magnet ramp parameters shared by he3_adr_cycle and ramp_down_magnet
+# Default ADR cycle and regulation configuration parameters
+DEFAULT_ADR_CONFIG = {
+    "charcoal_heat_sp": 55.0,        # Charcoal heater setpoint (K)
+    "flange_60k_heat_sp": 65.0,      # 60K flange heater setpoint (K)
+    "starting_temp_3k": 3.2,         # 3K stage starting temperature threshold (Channel C) before cycle starts (K)
+    "pot_precool_limit_k": 3.2,      # Alias for starting_temp_3k
+    "he3_condense_dwell_h": 3.5,     # Condensation dwell duration (hours)
+    "launch_temp_k": 1.0,            # Launch temperature: FAA temp threshold before opening ADR heat switch and ramping down magnet (K)
+    "launch_dwell_min": 10.0,        # Post-ADR-switch-open dwell / friction dissipation wait (minutes) before ramping down magnet
+    "magnet_max_hout": 58.1,         # Magnet max heat output (%)
+    "magnet_ramp_up_min": 45.0,      # Magnet ramp up duration (minutes)
+    "magnet_ramp_down_min": 60.0,    # Magnet ramp down duration (minutes) - slower ramp avoids inductive lag and eddy heating
+    "demag_settle_min": 20.0,        # Post-demag current settle wait (minutes) before zero-current interlock check
+    "regulate_temp_mk": 50.0,        # Closed-loop PID regulation setpoint (mK)
+    "regulate_temp_k": 0.050,        # Closed-loop PID regulation setpoint (K)
+}
+
+def get_adr_config(world=None):
+    """Retrieve active ADR configuration dict from world or defaults."""
+    cfg = dict(DEFAULT_ADR_CONFIG)
+    if world is not None and hasattr(world, "adr_config") and isinstance(world.adr_config, dict):
+        cfg.update(world.adr_config)
+    return cfg
+
+def get_adr_regulation_setpoint(world=None):
+    """
+    Retrieve regulation setpoint in (Kelvin, mK) safely handling mK vs K formats.
+    Guarantees target_k is strictly in Kelvin (e.g. 0.050) and target_mk is in mK (e.g. 50.0).
+    """
+    cfg = get_adr_config(world)
+    if "regulate_temp_mk" in cfg:
+        target_mk = float(cfg["regulate_temp_mk"])
+        target_k = target_mk / 1000.0 if target_mk >= 1.0 else target_mk
+        if target_mk < 1.0:
+            target_mk = target_k * 1000.0
+    elif "regulate_temp_k" in cfg:
+        val = float(cfg["regulate_temp_k"])
+        if val >= 1.0:  # Value was saved in mK (e.g. 50.0)
+            target_mk = val
+            target_k = val / 1000.0
+        else:  # Value was saved in K (e.g. 0.050)
+            target_k = val
+            target_mk = val * 1000.0
+    else:
+        target_k = 0.050
+        target_mk = 50.0
+    return target_k, target_mk
+
+# Legacy constants maintained for compatibility
 MAGNET_MAX_HOUT = 58.1           # LS370 open-loop output (%) at full field (~9.5 A)
 MAGNET_RAMP_TIME_S = 30*60       # full-scale ramp duration
 MAGNET_START_LIMIT_A = 0.2       # refuse to start a cycle above this magnet current
@@ -116,6 +186,11 @@ MAX_HE3_PRESSURE_BAR = 9.5
 class StationWorld(World):
     station: qcodes.station.Station = None
     datasaver: typing.Any = None
+    adr_config: dict = None
+
+    def __post_init__(self):
+        if self.adr_config is None:
+            self.adr_config = dict(DEFAULT_ADR_CONFIG)
 
     def update(self, state):
         update(self.datasaver, state)
@@ -143,15 +218,41 @@ class StationWorld(World):
             except Exception:
                 pass
 
+def safe_set_heatswitch(world, hs_name: str, target_state: str):
+    """Set heatswitch only if its cached state is not already target_state, avoiding redundant relay pulses."""
+    try:
+        if world and hasattr(world, "station") and hasattr(world.station, "labjack"):
+            param = getattr(world.station.labjack, f"heatswitch_{hs_name}", None)
+            if param is not None:
+                cur = param.cache.get()
+                if cur != target_state:
+                    param(target_state)
+    except Exception as e:
+        print(f"Warning: safe_set_heatswitch({hs_name}, {target_state}) error: {e}")
+
 @state 
 def he3_adr_cycle(world: StationWorld):
     testmode = False
-    # 1. check that we're cold enough to start
-    # 2. start heating charcoal
-    # 3. ramp up adr
-    # 4. wait for he3 to condense
-    # 5. cool charcoal
-    # 6. ramp down adr
+    cfg = get_adr_config(world)
+
+    charcoal_sp = float(cfg.get("charcoal_heat_sp", 55.0))
+    flange_sp = float(cfg.get("flange_60k_heat_sp", 65.0))
+    limit_3k = float(cfg.get("starting_temp_3k", cfg.get("pot_precool_limit_k", 3.2)))
+
+    condense_dwell_s = float(cfg.get("he3_condense_dwell_h", 3.5)) * 3600.0
+    launch_temp_k = float(cfg.get("launch_temp_k", 1.0))
+    launch_dwell_s = float(cfg.get("launch_dwell_min", 10.0)) * 60.0
+
+    target_hout = float(cfg.get("magnet_max_hout", MAGNET_MAX_HOUT))
+    ramp_up_s = float(cfg.get("magnet_ramp_up_min", 45.0)) * 60.0
+    ramp_down_s = float(cfg.get("magnet_ramp_down_min", 60.0)) * 60.0
+    demag_settle_s = float(cfg.get("demag_settle_min", 20.0)) * 60.0
+    if "regulate_temp_mk" in cfg:
+        target_mk = float(cfg["regulate_temp_mk"])
+        reg_temp_k = target_mk / 1000.0
+    else:
+        reg_temp_k = float(cfg.get("regulate_temp_k", 0.050))
+        target_mk = reg_temp_k * 1000.0
 
     # 0. safety: never start (and ramp from 0) while the magnet is energized
     check_magnet_deenergized(world)
@@ -159,34 +260,37 @@ def he3_adr_cycle(world: StationWorld):
     print("CLOSE THE GREEN HE3 VALVE")
 
     # 1. set heat switches and check that we're cold enough to start
-    world.set_phase("1/6: Pre-cooling Check (Pot < 3.2K)", 1, 6)
-    world.station.labjack.heatswitch_pot("CLOSED")
+    world.set_phase(f"Pre-cooling Check (3K < {limit_3k:.1f}K)", 1, 6)
+    safe_set_heatswitch(world, "pot", "CLOSED")
     world.wait(1)
-    world.station.labjack.heatswitch_adr("CLOSED")
+    safe_set_heatswitch(world, "adr", "CLOSED")
     world.wait(1)
-    world.station.labjack.heatswitch_charcoal("OPEN")
+    safe_set_heatswitch(world, "charcoal", "OPEN")
     world.wait(1)
     while True:
         mr = most_recent_measurements()
-        if mr.get("cryocon_chD_temperature", 100) < 3.2 or mr.get("cryocon_chC_temperature", 100) < 3.2:
+        c_temp = mr.get("cryocon_chC_temperature")
+        if c_temp is not None and np.isfinite(c_temp) and float(c_temp) < limit_3k:
             break
         world.wait(1)
 
     # 2. start heating charcoal
-    world.set_phase("2/6: Heating Sorption Charcoal (55K)", 2, 6)
+    world.set_phase(f"Heating Sorption Charcoal ({charcoal_sp:.0f}K)", 2, 6)
     world.station.cryocon.loop1_source("A")
     world.wait(1)
-    world.station.cryocon.loop1_setpoint(65) # Upper stage setpoint = 45 K, trying higher so i t actually goes up?
+    world.station.cryocon.loop1_setpoint(flange_sp)
     world.wait(1)
     world.station.cryocon.loop2_source("B")
     world.wait(1)
-    world.station.cryocon.loop2_setpoint(55) # Charcoal setpoint = 55 K
+    world.station.cryocon.loop2_range("HI")
+    world.wait(1)
+    world.station.cryocon.loop2_setpoint(charcoal_sp)
     world.wait(1)
     world.station.cryocon.control_enabled(True) # heat charcoal
     world.wait(1)
 
     # 3. ramp up adr
-    world.set_phase("3/6: Ramping ADR Magnet Up (1800s)", 3, 6)
+    world.set_phase("Ramping ADR Magnet Up", 3, 6)
     world.station.labjack.relay("RAMP")
     world.wait(1)
     ramp_controller = world.station.ls370.heater
@@ -194,83 +298,121 @@ def he3_adr_cycle(world: StationWorld):
     world.wait(1)
     ramp_controller.range("100uA")
     world.wait(1)
-    hout_start = 0
+
     if testmode:
-        target_hout = 1 # small max current
-        target_time_s = 30
+        t_hout = 1.0 # small max current
+        t_time_s = 30.0
     else:
-        target_hout= MAGNET_MAX_HOUT  # 55 should get to 9.53 A, which is the hardware current limit of the kepco supply
-        target_time_s = MAGNET_RAMP_TIME_S
-    target_step_duration_s = 1
-    target_N_steps = int(target_time_s/target_step_duration_s)
-    step_size = target_hout/target_N_steps
-    houts_up = np.arange(target_N_steps)*step_size
-    for hout in houts_up:
-        ramp_controller.out(hout)
-        world.wait(target_step_duration_s)
+        t_hout = target_hout
+        t_time_s = ramp_up_s
+
+    t_start_ramp = time.time()
+    while True:
+        elapsed = time.time() - t_start_ramp
+        fraction = min(1.0, elapsed / max(1.0, t_time_s))
+        hout = fraction * t_hout
+        ramp_controller.out(float(hout))
+        if fraction >= 1.0:
+            break
+        world.wait(1)
 
     # 4. wait for he3 to condense
-    world.set_phase("4/6: He-3 Condensation Dwell (3.5h)", 4, 6)
+    world.set_phase("He-3 Condensation Dwell", 4, 6)
     if testmode:
         world.wait(10)
     else:
-        world.wait(3600*3.5) # takes about 2 hours
+        world.wait(condense_dwell_s)
 
-    # 5. cool charcoal
-    world.set_phase("5/6: Cooling Charcoal Sorption Pump", 5, 6)
-    world.station.labjack.heatswitch_pot("OPEN")
+    # 5. cool charcoal and wait for FAA to reach launch temperature
+    disp_launch = f"{launch_temp_k * 1000.0:.0f}mK" if launch_temp_k < 1.0 else f"{launch_temp_k:.2f}K"
+    world.set_phase(f"Cooling to Launch Temp (FAA < {disp_launch})", 5, 6)
+    safe_set_heatswitch(world, "pot", "OPEN")
     world.wait(1)
-    world.station.cryocon.control_enabled(False) # turn off 40K heat after cooling pot
+    world.station.cryocon.control_enabled(False) # turn off heaters
     if testmode:
         world.wait(1)
     else: 
         world.wait(120) # a bit of cooling before closing charcoal heatswitch
-    world.station.labjack.heatswitch_charcoal("CLOSED")  
+    safe_set_heatswitch(world, "charcoal", "CLOSED")  
     world.wait(1)
     
     if testmode:
-        world.wait(10)
+        world.wait(5)
     else:
-        world.wait(3600*1)
-        world.station.cryocon.loop1_setpoint(65) 
-        world.wait(1)
-        world.station.cryocon.loop2_source("B")
-        world.wait(1)
-        world.station.cryocon.loop2_setpoint(1) # Charcoal setpoint = 1 K, AKA OFF
-        world.wait(1)
-        world.station.cryocon.control_enabled(True) # heat 40K stage
-        world.wait(3600*0.5) 
-        world.station.cryocon.control_enabled(False) # turn off 40K heat after cooling pot
-        world.wait(3600*2)
+        while True:
+            mr = most_recent_measurements()
+            faa_t = mr.get("faa_temperature")
+            if faa_t is not None and np.isfinite(faa_t) and float(faa_t) < launch_temp_k:
+                break
+            world.wait(1)
 
     # 6. ramp down adr
-    world.set_phase("6/6: Demag Ramp Down & Closed-Loop Control", 6, 6)
-    world.station.labjack.heatswitch_adr("OPEN")
+    safe_set_heatswitch(world, "adr", "OPEN")
     world.wait(1)
-    houts_down = houts_up[::-1]
-    for hout in houts_down:
-        ramp_controller.out(hout)
-        world.wait(target_step_duration_s)
+
+    if launch_dwell_s > 0:
+        world.set_phase(f"Launch Settle (Waiting {launch_dwell_s/60.0:.0f}m)", 6, 6)
+        if testmode:
+            world.wait(5)
+        else:
+            world.wait(launch_dwell_s)
+
+    target_k, target_mk = get_adr_regulation_setpoint(world)
+    reg_disp = f"{target_mk:.0f}mK" if target_mk < 1000.0 else f"{target_k:.3f}K"
+    world.set_phase(f"Demag Ramp Down & Regulate @ {reg_disp}", 6, 6)
+
     if testmode:
-        world.wait(30)
+        t_down_time_s = 30.0
     else:
-        world.wait(20*60) # let magnet current get smaller
+        t_down_time_s = ramp_down_s
+
+    t_start_down = time.time()
+    while True:
+        elapsed = time.time() - t_start_down
+        fraction = min(1.0, elapsed / max(1.0, t_down_time_s))
+        hout = (1.0 - fraction) * t_hout
+        ramp_controller.out(float(hout))
+        if fraction >= 1.0:
+            break
+        world.wait(1)
+
+    # 7. Settle and verify magnet current has genuinely reached near-zero (< 0.05 A) before switching relay
+    world.set_phase("Demag Settle (Waiting for I < 0.05A)", 6, 6)
+    if testmode:
+        world.wait(5)
+    else:
+        t_settle_start = time.time()
+        while True:
+            elapsed_settle = time.time() - t_settle_start
+            mr = most_recent_measurements()
+            cur_i = mr.get("labjack_kepco_current")
+            # Must wait at least demag_settle_s AND actual current must be < 0.05 A
+            if elapsed_settle >= demag_settle_s:
+                if cur_i is not None and np.isfinite(cur_i) and abs(float(cur_i)) < 0.05:
+                    break
+                # Fallback timeout if sensor is offline or has tiny DC offset
+                if elapsed_settle >= (demag_settle_s + 900.0) and (cur_i is None or abs(float(cur_i)) < 0.10):
+                    break
+            world.wait(1)
+
+    target_k, target_mk = get_adr_regulation_setpoint(world)
+    reg_disp = f"{target_mk:.0f}mK" if target_mk < 1000.0 else f"{target_k:.3f}K"
     world.station.labjack.relay("CONTROL")
     world.wait(30)
     ramp_controller.mode('closed')
     world.wait(1)
-    ramp_controller.setpoint(0.05)
+    ramp_controller.setpoint(target_k)
     world.wait(1)
     ramp_controller.range("100uA")
 
     # be done
-    world.set_phase("Idle — Holding Steady", 1, 1)
+    world.set_phase(f"Idle — Holding Steady (Regulating @ {reg_disp})", 1, 1)
     return wait_forever
 
 @state
 def ramp_down_magnet(world: StationWorld):
     # Safely ramps the LS370 open-loop output (magnet current) from its present
-    # value to 0 at the standard he3_adr_cycle rate, then holds idle.
+    # value to 0 at the configured magnet ramp-down rate, then holds idle.
     # Heat switches, relay and Cryo-con are left untouched.
     world.set_phase("Safe Ramp Down: reading magnet drive", 1, 1)
     rc = world.station.ls370.heater
@@ -283,11 +425,19 @@ def ramp_down_magnet(world: StationWorld):
     if not np.isfinite(start_hout) or start_hout <= 0:
         world.set_phase("Idle — Holding Steady", 1, 1)
         return wait_forever
-    rate_per_s = MAGNET_MAX_HOUT / MAGNET_RAMP_TIME_S
-    n_steps = max(1, int(np.ceil(start_hout / rate_per_s)))
-    world.set_phase(f"Safe Ramp Down: {start_hout:.1f}% -> 0% ({n_steps} s)", 1, 1)
-    for hout in np.linspace(start_hout, 0.0, n_steps + 1)[1:]:
+    cfg = get_adr_config(world)
+    max_hout = float(cfg.get("magnet_max_hout", MAGNET_MAX_HOUT))
+    ramp_time_s = float(cfg.get("magnet_ramp_down_min", 45.0)) * 60.0
+    actual_ramp_time_s = max(1.0, (start_hout / max(0.01, max_hout)) * ramp_time_s)
+    world.set_phase(f"Safe Ramp Down: {start_hout:.1f}% -> 0%", 1, 1)
+    t_start_safe = time.time()
+    while True:
+        elapsed = time.time() - t_start_safe
+        fraction = min(1.0, elapsed / actual_ramp_time_s)
+        hout = (1.0 - fraction) * start_hout
         rc.out(float(hout))
+        if fraction >= 1.0:
+            break
         world.wait(1)
     world.set_phase("Idle — Holding Steady (magnet ramped down)", 1, 1)
     return wait_forever
@@ -352,74 +502,105 @@ def he3_only_cycle(world: StationWorld):
     at the 1K pot without touching or energizing the superconducting magnet.
     """
     testmode = False
+    cfg = get_adr_config(world)
+
+    charcoal_sp = float(cfg.get("charcoal_heat_sp", 55.0))
+    flange_sp = float(cfg.get("flange_60k_heat_sp", 65.0))
+    limit_3k = float(cfg.get("starting_temp_3k", cfg.get("pot_precool_limit_k", 3.2)))
+
+    condense_dwell_s = float(cfg.get("he3_condense_dwell_h", 3.5)) * 3600.0
+    launch_temp_k = float(cfg.get("launch_temp_k", 1.0))
+
     # 0. safety: check magnet is de-energized
     check_magnet_deenergized(world)
     # Operator must close the green He-3 valve BEFORE step 1
     print("CLOSE THE GREEN HE3 VALVE")
 
     # 1. set heat switches and check that we're cold enough to start
-    world.set_phase("1/4: Pre-cooling Check (Pot < 3.2K)", 1, 4)
-    world.station.labjack.heatswitch_pot("CLOSED")
+    world.set_phase(f"Pre-cooling Check (3K < {limit_3k:.1f}K)", 1, 4)
+    safe_set_heatswitch(world, "pot", "CLOSED")
     world.wait(1)
-    world.station.labjack.heatswitch_adr("CLOSED")
+    safe_set_heatswitch(world, "adr", "CLOSED")
     world.wait(1)
-    world.station.labjack.heatswitch_charcoal("OPEN")
+    safe_set_heatswitch(world, "charcoal", "OPEN")
     world.wait(1)
     while True:
         mr = most_recent_measurements()
-        if mr.get("cryocon_chD_temperature", 100) < 3.2 or mr.get("cryocon_chC_temperature", 100) < 3.2:
+        c_temp = mr.get("cryocon_chC_temperature")
+        if c_temp is not None and np.isfinite(c_temp) and float(c_temp) < limit_3k:
             break
         world.wait(1)
 
     # 2. start heating charcoal
-    world.set_phase("2/4: Heating Sorption Charcoal (55K)", 2, 4)
+    world.set_phase(f"Heating Sorption Charcoal ({charcoal_sp:.0f}K)", 2, 4)
     world.station.cryocon.loop1_source("A")
     world.wait(1)
-    world.station.cryocon.loop1_setpoint(65)
+    world.station.cryocon.loop1_setpoint(flange_sp)
     world.wait(1)
     world.station.cryocon.loop2_source("B")
     world.wait(1)
-    world.station.cryocon.loop2_setpoint(55) # Charcoal setpoint = 55 K
+    world.station.cryocon.loop2_range("HI")
+    world.wait(1)
+    world.station.cryocon.loop2_setpoint(charcoal_sp) # Charcoal setpoint = 55 K
     world.wait(1)
     world.station.cryocon.control_enabled(True) # heat charcoal
     world.wait(1)
 
     # 3. wait for he3 to condense
-    world.set_phase("3/4: He-3 Condensation Dwell (3.5h)", 3, 4)
+    world.set_phase("He-3 Condensation Dwell", 3, 4)
     if testmode:
         world.wait(10)
     else:
-        world.wait(3600*3.5) # takes about 3.5 hours to condense He-3
+        world.wait(condense_dwell_s) # takes about 3.5 hours to condense He-3
 
-    # 4. cool charcoal
-    world.set_phase("4/4: Cooling Charcoal Sorption Pump (~3.5h)", 4, 4)
-    world.station.labjack.heatswitch_pot("OPEN") # thermally isolate 1K pot
+    # 4. cool charcoal and wait for launch/base temperature
+    disp_launch = f"{launch_temp_k * 1000.0:.0f}mK" if launch_temp_k < 1.0 else f"{launch_temp_k:.2f}K"
+    world.set_phase(f"Cooling to Base Temp (FAA / Pot < {disp_launch})", 4, 4)
+    safe_set_heatswitch(world, "pot", "OPEN") # thermally isolate 1K pot
     world.wait(1)
-    world.station.cryocon.control_enabled(False) # turn off 40K heat
+    world.station.cryocon.control_enabled(False) # turn off heaters
     if testmode:
         world.wait(1)
-    else:
+    else: 
         world.wait(120) # a bit of cooling before closing charcoal heatswitch
-    world.station.labjack.heatswitch_charcoal("CLOSED")  
+    safe_set_heatswitch(world, "charcoal", "CLOSED")  
     world.wait(1)
     
     if testmode:
-        world.wait(10)
+        world.wait(5)
     else:
-        world.wait(3600*1)
-        world.station.cryocon.loop1_setpoint(65) 
-        world.wait(1)
-        world.station.cryocon.loop2_source("B")
-        world.wait(1)
-        world.station.cryocon.loop2_setpoint(1) # Charcoal setpoint = 1 K, AKA OFF
-        world.wait(1)
-        world.station.cryocon.control_enabled(True) # heat 40K stage
-        world.wait(3600*0.5) 
-        world.station.cryocon.control_enabled(False) # turn off 40K heat after cooling pot
-        world.wait(3600*2)
+        while True:
+            mr = most_recent_measurements()
+            faa_t = mr.get("faa_temperature")
+            pot_t = mr.get("cryocon_chD_temperature")
+            if (faa_t is not None and np.isfinite(faa_t) and float(faa_t) < launch_temp_k) or (pot_t is not None and np.isfinite(pot_t) and float(pot_t) < launch_temp_k):
+                break
+            world.wait(1)
 
     # Done — holding steady at base temperature
     world.set_phase("Idle — Holding Steady (He-3 Cycle Complete)", 1, 1)
+    return wait_forever
+
+@state
+def regulate_temperature(world: StationWorld):
+    """
+    Engage closed-loop PID temperature regulation on the Lake Shore 370.
+    Switches relay to CONTROL, sets heater mode to closed, applies setpoint,
+    and enables 100uA heater excitation range.
+    """
+    target_k, target_mk = get_adr_regulation_setpoint(world)
+    disp_target = f"{target_mk:.1f} mK" if target_mk < 1000.0 else f"{target_k:.3f} K"
+    world.set_phase(f"Regulating @ {disp_target}", 1, 1)
+
+    world.station.labjack.relay("CONTROL")
+    world.wait(2)
+    rc = world.station.ls370.heater
+    rc.mode('closed')
+    world.wait(1)
+    rc.setpoint(target_k)
+    world.wait(1)
+    rc.range("100uA")
+    world.set_phase(f"Idle — Holding Steady (Regulating @ {disp_target})", 1, 1)
     return wait_forever
 
 @state
@@ -436,9 +617,203 @@ def warmup_300K(world: StationWorld):
     world.station.cryocon.loop1_source("A")
     world.station.cryocon.loop1_setpoint(295) # Upper stage setpoint = 295 K
     world.station.cryocon.loop2_source("B")
+    world.station.cryocon.loop2_range("HI")
     world.station.cryocon.loop2_setpoint(295) # Charcoal setpoint = 295 K
     world.station.cryocon.control_enabled(True) # heat charcoal
     world.wait(1e15)
 
-STATES_LIST = [wait_forever, ready_for_cooldown, he3_only_cycle, he3_adr_cycle, ramp_down_magnet, warmup_300K, wait_forever2, switch_to_wait_forever_test, open_adr_heatswitch, open_charcoal_heatswitch, open_pot_heatswitch, set_relay_to_ramp]
+def find_full_field_start_time(target_hout):
+    """Find timestamp when magnet first reached full field today without yielding across log lines."""
+    try:
+        today_log = Path.home() / "2pac_logs" / datetime.now().strftime("%Y-%m-%d") / "out.log"
+        if today_log.exists():
+            with open(today_log, "r") as f:
+                for line in f:
+                    parts = line.strip().split(",")
+                    if len(parts) >= 3:
+                        try:
+                            if float(parts[2]) >= (target_hout - 1.0):
+                                return float(parts[0])
+                        except ValueError:
+                            continue
+    except Exception as e:
+        print(f"Notice: Could not parse full field start time: {e}")
+    return None
+
+@state
+def resume_he3_adr_cycle(world: StationWorld):
+    """
+    Resume an in-progress He-3 + ADR cycle from Condensation Dwell (Step 4/6) or Cooling (Step 5/6).
+    Leaves the magnet energized at full field, verifies all heat switches and
+    Cryo-con loops, completes the remaining condensation dwell time, then
+    cools charcoal (Step 5) and ramps down the magnet (Step 6) to regulate at base.
+    """
+    testmode = False
+    cfg = get_adr_config(world)
+    charcoal_sp = float(cfg.get("charcoal_heat_sp", 55.0))
+    flange_sp = float(cfg.get("flange_60k_heat_sp", 65.0))
+    condense_dwell_s = float(cfg.get("he3_condense_dwell_h", 3.5)) * 3600.0
+    launch_temp_k = float(cfg.get("launch_temp_k", 1.0))
+    launch_dwell_s = float(cfg.get("launch_dwell_min", 10.0)) * 60.0
+
+    target_hout = float(cfg.get("magnet_max_hout", MAGNET_MAX_HOUT))
+    ramp_down_s = float(cfg.get("magnet_ramp_down_min", 60.0)) * 60.0
+    demag_settle_s = float(cfg.get("demag_settle_min", 20.0)) * 60.0
+    if "regulate_temp_mk" in cfg:
+        target_mk = float(cfg["regulate_temp_mk"])
+        reg_temp_k = target_mk / 1000.0
+    else:
+        reg_temp_k = float(cfg.get("regulate_temp_k", 0.050))
+        target_mk = reg_temp_k * 1000.0
+
+    t_full_field = find_full_field_start_time(target_hout)
+    now = time.time()
+    condensation_complete = (t_full_field is not None and (now - t_full_field) >= condense_dwell_s)
+
+    # Check if charcoal is already cold (< 15 K)
+    mr_init = most_recent_measurements()
+    ch_b = mr_init.get("cryocon_chB_temperature")
+    charcoal_already_cold = (ch_b is not None and np.isfinite(ch_b) and float(ch_b) < 15.0)
+
+    if condensation_complete or charcoal_already_cold:
+        # Step 4 condensation dwell is already finished and charcoal is cold
+        # Maintain existing switch positions without pulsing: Pot OPEN, Charcoal CLOSED, ADR CLOSED
+        safe_set_heatswitch(world, "pot", "OPEN")
+        world.wait(1)
+        safe_set_heatswitch(world, "charcoal", "CLOSED")
+        world.wait(1)
+        safe_set_heatswitch(world, "adr", "CLOSED")
+        world.wait(1)
+        if hasattr(world.station, "cryocon"):
+            try:
+                world.station.cryocon.control_enabled(False)
+            except Exception:
+                pass
+    else:
+        # Step 4: Condensation Dwell
+        safe_set_heatswitch(world, "pot", "CLOSED")
+        world.wait(1)
+        safe_set_heatswitch(world, "adr", "CLOSED")
+        world.wait(1)
+        safe_set_heatswitch(world, "charcoal", "OPEN")
+        world.wait(1)
+
+        world.station.cryocon.loop1_source("A")
+        world.wait(1)
+        world.station.cryocon.loop1_setpoint(flange_sp)
+        world.wait(1)
+        world.station.cryocon.loop2_source("B")
+        world.wait(1)
+        world.station.cryocon.loop2_range("HI")
+        world.wait(1)
+        world.station.cryocon.loop2_setpoint(charcoal_sp)
+        world.wait(1)
+        world.station.cryocon.control_enabled(True)
+        world.wait(1)
+
+        remaining_s = max(10.0, condense_dwell_s - (now - t_full_field)) if t_full_field is not None else condense_dwell_s
+        world.set_phase("He-3 Condensation Dwell", 4, 6)
+        if testmode:
+            world.wait(10)
+        else:
+            world.wait(remaining_s)
+
+        # 5. cool charcoal and wait for FAA to reach launch temperature
+        safe_set_heatswitch(world, "pot", "OPEN")
+        world.wait(1)
+        world.station.cryocon.control_enabled(False)
+        if not testmode:
+            world.wait(120)
+        safe_set_heatswitch(world, "charcoal", "CLOSED")
+        world.wait(1)
+
+    # 5. Cooling to launch temp phase
+    disp_launch = f"{launch_temp_k * 1000.0:.0f}mK" if launch_temp_k < 1.0 else f"{launch_temp_k:.2f}K"
+    world.set_phase(f"Cooling to Launch Temp (FAA < {disp_launch})", 5, 6)
+    if testmode:
+        world.wait(5)
+    else:
+        while True:
+            mr = most_recent_measurements()
+            faa_t = mr.get("faa_temperature")
+            if faa_t is not None and np.isfinite(faa_t) and float(faa_t) < launch_temp_k:
+                break
+            world.wait(1)
+
+    # 6. ramp down adr
+    safe_set_heatswitch(world, "adr", "OPEN")
+    world.wait(1)
+
+    if launch_dwell_s > 0:
+        world.set_phase(f"Launch Settle (Waiting {launch_dwell_s/60.0:.0f}m)", 6, 6)
+        if testmode:
+            world.wait(5)
+        else:
+            world.wait(launch_dwell_s)
+
+    target_k, target_mk = get_adr_regulation_setpoint(world)
+    reg_disp = f"{target_mk:.0f}mK" if target_mk < 1000.0 else f"{target_k:.3f}K"
+    world.set_phase(f"Demag Ramp Down & Regulate @ {reg_disp}", 6, 6)
+
+    t_start_down = time.time()
+    t_down_time_s = 30.0 if testmode else ramp_down_s
+    ramp_controller = world.station.ls370.heater
+    while True:
+        elapsed = time.time() - t_start_down
+        fraction = min(1.0, elapsed / max(1.0, t_down_time_s))
+        hout = (1.0 - fraction) * target_hout
+        ramp_controller.out(float(hout))
+        if fraction >= 1.0:
+            break
+        world.wait(1)
+
+    # Settle and verify magnet current has genuinely reached near-zero (< 0.05 A) before switching relay
+    world.set_phase("Demag Settle (Waiting for I < 0.05A)", 6, 6)
+    if testmode:
+        world.wait(5)
+    else:
+        t_settle_start = time.time()
+        while True:
+            elapsed_settle = time.time() - t_settle_start
+            mr = most_recent_measurements()
+            cur_i = mr.get("labjack_kepco_current")
+            # Must wait at least demag_settle_s AND actual current must be < 0.05 A
+            if elapsed_settle >= demag_settle_s:
+                if cur_i is not None and np.isfinite(cur_i) and abs(float(cur_i)) < 0.05:
+                    break
+                # Fallback timeout if sensor is offline or has tiny DC offset
+                if elapsed_settle >= (demag_settle_s + 900.0) and (cur_i is None or abs(float(cur_i)) < 0.10):
+                    break
+            world.wait(1)
+
+    target_k, target_mk = get_adr_regulation_setpoint(world)
+    reg_disp = f"{target_mk:.0f}mK" if target_mk < 1000.0 else f"{target_k:.3f}K"
+    world.station.labjack.relay("CONTROL")
+    world.wait(30)
+    ramp_controller.mode('closed')
+    world.wait(1)
+    ramp_controller.setpoint(target_k)
+    world.wait(1)
+    ramp_controller.range("100uA")
+
+    # be done
+    world.set_phase(f"Idle — Holding Steady (Regulating @ {reg_disp})", 1, 1)
+    return wait_forever
+
+STATES_LIST = [
+    wait_forever,
+    ready_for_cooldown,
+    he3_only_cycle,
+    he3_adr_cycle,
+    resume_he3_adr_cycle,
+    regulate_temperature,
+    ramp_down_magnet,
+    warmup_300K,
+    wait_forever2,
+    switch_to_wait_forever_test,
+    open_adr_heatswitch,
+    open_charcoal_heatswitch,
+    open_pot_heatswitch,
+    set_relay_to_ramp,
+]
 STATES_DICT = {s.name(): s for s in STATES_LIST}

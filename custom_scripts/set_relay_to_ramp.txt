@@ -1,3 +1,0 @@
-# Set Relay to RAMP
-set relay RAMP
-return wait_forever

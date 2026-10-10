@@ -5,8 +5,14 @@
 set -e
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-ICON_PATH="$SCRIPT_DIR/adr_gui_icon.png"
-LAUNCHER_PATH="$SCRIPT_DIR/launch_gui.sh"
+if [ -f "$SCRIPT_DIR/main.py" ]; then
+    PROJECT_DIR="$SCRIPT_DIR"
+else
+    PROJECT_DIR="$( cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd )"
+fi
+ICON_PATH="$PROJECT_DIR/assets/adr_gui_icon.png"
+[ ! -f "$ICON_PATH" ] && ICON_PATH="$PROJECT_DIR/adr_gui_icon.png"
+LAUNCHER_PATH="$PROJECT_DIR/launch_gui.sh"
 
 chmod +x "$LAUNCHER_PATH"
 

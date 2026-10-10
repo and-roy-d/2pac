@@ -1,7 +1,15 @@
 import sys
 import time
 import sqlite3
+import signal
+import faulthandler
 from pathlib import Path
+
+faulthandler.enable()
+try:
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+except Exception:
+    pass
 
 # Enable multi-threaded access to SQLite so background data thread can commit results
 _orig_sqlite3_connect = sqlite3.connect
@@ -13,9 +21,18 @@ from PyQt5.QtWidgets import QApplication, QSplashScreen
 from PyQt5.QtGui import QPixmap, QColor, QPainter, QFont, QIcon, QPainterPath
 from PyQt5.QtCore import Qt, QRectF, QTimer
 
+def _resolve_icon_path():
+    for p in [
+        Path(__file__).parent / "assets" / "adr_gui_icon.png",
+        Path(__file__).parent / "adr_gui_icon.png",
+    ]:
+        if p.exists():
+            return p
+    return Path(__file__).parent / "assets" / "adr_gui_icon.png"
+
 def create_splash_pixmap(icon_path=None):
     if icon_path is None:
-        icon_path = Path(__file__).parent / "adr_gui_icon.png"
+        icon_path = _resolve_icon_path()
 
     width = 380
     height = 420
@@ -74,7 +91,7 @@ def create_splash_pixmap(icon_path=None):
     return pixmap
 
 def main():
-    icon_path = Path(__file__).parent / "adr_gui_icon.png"
+    icon_path = _resolve_icon_path()
 
     # Set application identity and WM_CLASS so GNOME Shell pairs windows with 2pac_gui.desktop
     sys.argv[0] = "2pac_gui"
@@ -109,9 +126,9 @@ def main():
     app.processEvents()
 
     # 4. Connect Hardware Drivers while keeping Qt responsive
-    from station_2pac import get_station
+    from instruments import get_station
     import states
-    from custom_script_loader import load_all_desktop_scripts
+    from engine import load_all_desktop_scripts
     
     st = get_station()
     states.st = st

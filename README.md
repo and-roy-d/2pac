@@ -61,9 +61,9 @@ The 2PAC ADR is controlled through three primary instrument interfaces managed v
 |  LabJack U3-HV   |         |  Cryo-con Model 24C|         | Lake Shore Model370|
 |      (USB)       |         | (/dev/ttyUSB0 Serial)|        |(/dev/ttyUSB1 Serial)|
 +------------------+         +--------------------+         +--------------------+
-  | AI0: Magnet V              | Ch A: 40K Stage              | Ch 1: FAA Thermometer
+  | AI0: Magnet V              | Ch A: 60K Flange             | Ch 1: FAA Thermometer
   | AI1: Magnet I              | Ch B: Charcoal Sorption      | Heater: Magnet Ramp
-  | AI2: He3 Pressure          | Ch C: 3K Plate               |         Controller
+  | AI2: He3 Pressure          | Ch C: 4K Flange              |         Controller
   | FIO4: HS ADR               | Ch D: Pot                    |
   | FIO5: HS Charcoal          | Loop 1: Sorption Heater      |
   | FIO6: HS Pot               | Loop 2: Stage Heater         |
@@ -262,9 +262,9 @@ Telemetry is automatically saved every second to daily timestamped folders locat
 
 ### 1. SQLite Database (`2pac.db`)
 Full QCoDeS dataset containing all synchronized channels with elapsed time setpoints:
-- `cryocon_chA_temperature` (40K)
+- `cryocon_chA_temperature` (60K flange)
 - `cryocon_chB_temperature` (Charcoal)
-- `cryocon_chC_temperature` (3K Plate)
+- `cryocon_chC_temperature` (4K flange)
 - `cryocon_chD_temperature` (Pot)
 - `faa_temperature` (Lake Shore FAA stage)
 - `labjack_he3_pressure` (He-3 line bar)
@@ -288,31 +288,57 @@ Each line contains: `<epoch_timestamp> <value>\n`.
 
 ```
 2pac/
-├── 2pac_gui.desktop          # XDG Desktop application entry
-├── adr_gui_icon.png          # Application logo icon
-├── custom_scripts/           # Built-in template procedure scripts
-│   ├── he3_adr_cycle.txt
-│   ├── ready_for_cooldown.txt
-│   ├── warmup_300K.txt
+├── main.py                     # Application entry point & hardware init
+├── gui.py                      # Modern PyQt5 graphical interface
+├── plot_utils.py               # Matplotlib interactive plotting, locators, formatters
+├── daily_logger.py             # SQLite daily telemetry logger, preloader, and cache
+├── states.py                   # ADR state machine procedures & StationWorld safety
+├── launch_gui.sh               # Application launch shell script
+├── pyproject.toml              # Project packaging metadata & dependencies
+├── requirements.txt            # Python dependencies list
+├── README.md                   # System documentation
+│
+├── engine/                     # State machine & procedure execution engine
+│   ├── __init__.py             # Exports World, WaitUntil, state, State, loader functions
+│   ├── world.py                # State machine execution engine & timing loop
+│   ├── imperative_statemachine.py # Coroutine-based line-by-line state machine engine
+│   └── custom_script_loader.py # Desktop pseudocode script compiler
+│
+├── instruments/                # Hardware instrument drivers and station setup
+│   ├── __init__.py             # Exports get_station, LabjackU3, Cryocon24C, LakeshoreModel370
+│   ├── station_2pac.py         # QCoDeS Station builder
+│   ├── labjacku3.py            # LabJack U3 USB driver with thread-safe RLock
+│   ├── cryocon24c.py           # Cryo-con 24C temperature controller VISA driver
+│   ├── lakeshore370.py         # Lake Shore 370 resistance bridge driver
+│   └── lakeshore370_base.py    # Lake Shore base instrument classes
+│
+├── custom_scripts/             # Plaintext procedure templates
+│   ├── he3_adr_cycle.txt       # Full He-3 condensation + ADR cycle
+│   ├── he3_only_cycle.txt      # He-3 cycle without magnet
+│   ├── ready_for_cooldown.txt  # Pre-cooling configuration
+│   ├── warmup_300K.txt         # 300 K system warm-up
 │   └── ...
-├── custom_script_loader.py   # Pseudocode compiler & Desktop script loader
-├── gui.py                    # Main PyQt5 application, themes, & canvas
-├── imperative_statemachine.py# Generator-based state machine engine
-├── install_desktop_icon.sh   # Automated desktop launcher installer
-├── launch_gui.sh             # Portable launcher shell script
-├── main.py                   # Application entrypoint & hardware init
-├── plot_utils.py             # Viewport slicing, SmartTimeLocator, & theming
-├── pyproject.toml            # Project packaging metadata & dependencies
-├── requirements.txt          # Python dependencies list
-├── states.py                 # Core cryogenic state procedures & definitions
-├── station_2pac.py           # Hardware station initialization
-├── world.py                  # State machine execution & timing engine
-├── drivers/
-│   ├── cryocon24c.py         # Cryo-con 24C temperature controller driver
-│   ├── labjacku3.py          # LabJack U3-HV ADC/DAC & relay driver
-│   ├── lakeshore370.py       # Lake Shore 370 resistance bridge driver
-│   └── lakeshore370_base.py  # Lake Shore base instrument classes
-└── README.md                 # System documentation
+│
+├── assets/                     # Graphical assets and desktop files
+│   ├── adr_gui_icon.png        # Application desktop icon
+│   └── 2pac_gui.desktop        # Linux XDG desktop entry
+│
+├── scripts/                    # Shell scripts
+│   ├── launch_gui.sh           # Shell launcher
+│   └── install_desktop_icon.sh # Desktop shortcut installer
+│
+├── docs/                       # Detailed documentation
+│   ├── ARCHITECTURE.md         # Software architecture and subsystem breakdown
+│   └── PROCEDURES.md           # Operational procedure guides and safety rules
+│
+└── older/                      # Archived legacy implementations (historical reference)
+    ├── README.md               # Summary of archived legacy code
+    ├── 2pacgui_qt.py           # Original monolithic PyQt GUI
+    ├── log_data.py             # Original text-file CSV logger
+    ├── read_logs.py            # Original offline text log parser
+    ├── world_no_mpl.py         # Headless non-matplotlib runner
+    ├── nonblocking_readline.py # Legacy non-blocking stdin reader
+    └── guitodo.txt             # Original developer scratchpad
 ```
 
 ---
@@ -352,4 +378,3 @@ Update port names in `station_2pac.py` if necessary:
 ## License
 
 Proprietary / Internal Research Laboratory Software — NIST / Quantum Sensors Project.
-

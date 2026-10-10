@@ -152,18 +152,18 @@ class LabjackU3(qcodes.Instrument):
             self.pulse_digital_state(10)
         elif x=="UNKNOWN":
             pass
-        else:
-            raise ValueError(x)
-        
-    def _charcoal_hs_control(self, x):
-        if x =="OPEN":
-            self.pulse_digital_state(19)
-        elif x=="CLOSED":
-            self.pulse_digital_state(17)
-        elif x=="UNKNOWN":
-            pass
-        else:
-            raise ValueError(x)
-        
 
-        
+
+
+
+
+
+
+
+
+
+
+
+
+
+

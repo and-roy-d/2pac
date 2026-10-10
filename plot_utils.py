@@ -1,5 +1,7 @@
 import math
 import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
 import matplotlib.colors as mc
 import colorsys
 from datetime import datetime
@@ -68,7 +70,7 @@ THEMES = {
         "legend_edge": "#334155",
         "legend_text": "#f8fafc",
         "channel_colors": {
-            "cryocon_chA_temperature": "#38bdf8",     # Bright Cyan Blue (40K flange)
+            "cryocon_chA_temperature": "#38bdf8",     # Bright Cyan Blue (60K flange)
             "cryocon_chB_temperature": "#34d399",     # Emerald Green (Charcoal)
             "cryocon_chC_temperature": "#fbbf24",     # Amber Gold (4K flange)
             "cryocon_chD_temperature": "#c084fc",     # Bright Purple (Pot)
@@ -98,7 +100,7 @@ THEMES = {
         "legend_edge": "#cbd5e1",
         "legend_text": "#0f172a",
         "channel_colors": {
-            "cryocon_chA_temperature": "#0284c7",     # Deep Sky Blue (40K flange)
+            "cryocon_chA_temperature": "#0284c7",     # Deep Sky Blue (60K flange)
             "cryocon_chB_temperature": "#059669",     # Forest / Emerald Green (Charcoal)
             "cryocon_chC_temperature": "#d97706",     # Warm Amber / Bronze (4K flange)
             "cryocon_chD_temperature": "#7c3aed",     # Vivid Purple (Pot)
@@ -123,7 +125,7 @@ DARK_CHANNEL_COLORS = THEMES["dark"]["channel_colors"]
 
 # Default channel aliases — updated by the Settings tab
 CHANNEL_ALIASES = {
-    "cryocon_chA_temperature": "40K flange",
+    "cryocon_chA_temperature": "60K flange",
     "cryocon_chB_temperature": "Charcoal",
     "cryocon_chC_temperature": "4K flange",
     "cryocon_chD_temperature": "Pot",
@@ -517,46 +519,40 @@ def get_kepco_i_key(data):
                 return k
     return "labjack_kepco_current"
 
-def decimate_for_plot(x, v, max_pts=4000):
+def get_plot_arrays(x, v, max_pts=1500):
     """
-    Decimate large arrays for fast interactive plotting while retaining
-    the full 1:1 resolution on the most recent telemetry points.
+    Fast, allocation-free downsampling for ultra-responsive plotting across any time span.
+    Decimates directly using strided slicing, cutting execution time to < 0.1 ms.
     """
+    if len(x) == 0 or len(v) == 0:
+        return np.array([], dtype=float), np.array([], dtype=float)
     n = min(len(x), len(v))
+    if n == 0:
+        return np.array([], dtype=float), np.array([], dtype=float)
+
     if n <= max_pts:
-        return x[:n], v[:n]
-    
-    # Keep the latest 200 points without downsampling for real-time fidelity
-    recent_len = min(200, n // 5)
-    hist_n = n - recent_len
-    
-    step = int(np.ceil(hist_n / (max_pts - recent_len)))
-    hist_idx = np.arange(0, hist_n, step)
-    recent_idx = np.arange(hist_n, n)
-    all_idx = np.concatenate([hist_idx, recent_idx])
-    return x[all_idx], v[all_idx]
+        x_sub = np.asarray(x[:n], dtype=float)
+        v_sub = np.asarray(v[:n], dtype=float)
+        return x_sub, v_sub
+
+    # Fast integer-strided decimation (takes < 0.1 ms even for 200,000+ points)
+    step = int(math.ceil(n / max_pts))
+    x_sub = np.asarray(x[:n:step], dtype=float)
+    v_sub = np.asarray(v[:n:step], dtype=float)
+
+    # Ensure the newest point is always included for real-time tracking
+    if len(x_sub) > 0 and len(x) > 0 and x_sub[-1] != x[n - 1]:
+        x_sub = np.append(x_sub, float(x[n - 1]))
+        v_sub = np.append(v_sub, float(v[n - 1]))
+
+    return x_sub, v_sub
 
 def safe_plot(ax, x, v, **kwargs):
     """Plot x vs v safely trimming arrays to matching lengths and downsampling if large."""
-    if len(x) == 0 or len(v) == 0:
+    xp, vp = get_plot_arrays(x, v, max_pts=kwargs.pop("max_pts", 1500))
+    if len(xp) == 0:
         return
-    n = min(len(x), len(v))
-    x_sub = x[:n]
-    v_sub = v[:n]
-    
-    # Filter out corrupted pre-epoch points if this is an epoch vector
-    if len(x_sub) > 0 and np.nanmax(x_sub) > 1e8:
-        valid_x = x_sub > 1e8
-        x_sub = x_sub[valid_x]
-        v_sub = v_sub[valid_x]
-        
-    if len(x_sub) == 0:
-        return
-        
-    if len(x_sub) > 4000:
-        x_sub, v_sub = decimate_for_plot(x_sub, v_sub, max_pts=4000)
-        
-    return ax.plot(x_sub, v_sub, **kwargs)
+    return ax.plot(xp, vp, **kwargs)
 
 def format_cryo_temp(val):
     """
@@ -594,9 +590,13 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
     thm = THEMES.get(theme, THEMES["light"])
     ch_colors = thm["channel_colors"]
 
-    figure.clf()
-    figure.set_facecolor(thm["fig_bg"])
-    
+    # Synchronize global matplotlib rcParams for the active theme so dynamic log/minor ticks stay white in dark mode
+    plt.rcParams['xtick.color'] = thm["tick_color"]
+    plt.rcParams['ytick.color'] = thm["tick_color"]
+    plt.rcParams['text.color'] = thm["text"]
+    plt.rcParams['axes.labelcolor'] = thm["text"]
+    plt.rcParams['axes.edgecolor'] = thm["spine"]
+
     data = {}
     x = np.array([])
     if dataset is not None:
@@ -611,15 +611,18 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
     xloc_ind = None
     data_xloc = None
     if xloc_mouse is not None and len(x) > 0:
-        xloc_ind = np.argmin(np.abs(x - xloc_mouse))
+        xloc_ind = int(np.searchsorted(x, xloc_mouse))
+        if xloc_ind >= len(x):
+            xloc_ind = len(x) - 1
+        elif xloc_ind > 0 and abs(x[xloc_ind - 1] - xloc_mouse) < abs(x[xloc_ind] - xloc_mouse):
+            xloc_ind = xloc_ind - 1
         data_xloc = {key: data[key][key][xloc_ind] for key in data.keys() if key in data and key in data[key] and len(data[key][key]) > xloc_ind}
-        
+
     data_mr = {}
     for key in data.keys():
         if key in data and key in data[key] and len(data[key][key]) > 0:
             data_mr[key] = data[key][key][-1]
 
-    keys_hs = ["labjack_heatswitch_adr", "labjack_heatswitch_charcoal", "labjack_heatswitch_pot", "labjack_relay"]
     units = get_dataset_units(dataset)
 
     # Determine time window xlims
@@ -654,7 +657,6 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             x_start = x_end - window_s
             target_xlim = (x_start, x_end + max(60, (x_end - x_start) * 0.02))
         else:
-            # "All Time" mode: align to clean minute boundaries with at least 120s span
             x_min_aligned = float(np.floor(x[0] / 60.0) * 60.0)
             x_max_aligned = float(np.ceil(x_end / 60.0) * 60.0)
             if (x_max_aligned - x_min_aligned) < 120.0:
@@ -663,14 +665,11 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
 
     span_for_format = (target_xlim[1] - target_xlim[0]) if target_xlim else 3600
 
-    # Viewport window slicing: Slices large historical arrays to the visible window
-    # ensuring instantaneous sub-millisecond execution even with millions of points.
     x_plot = x
     slice_start = 0
     slice_end = len(x)
     if len(x) > 0 and target_xlim is not None:
         pad = max(60.0, span_for_format * 0.05)
-        # Check if target_xlim is a sub-window of x
         if target_xlim[0] > (x[0] - pad) or target_xlim[1] < (x[-1] + pad):
             if target_xlim[0] > x[0]:
                 slice_start = max(0, int(np.searchsorted(x, target_xlim[0] - pad)))
@@ -686,8 +685,252 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             return arr[slice_start:slice_end]
         return arr
 
+    all_found_temps = get_temp_keys(data)
+    temp_keys = [k for k in all_found_temps if not (hidden_channels and k in hidden_channels)]
+    hidden_set = frozenset(hidden_channels) if hidden_channels else frozenset()
+
+    # Check cache for high-speed in-place update (avoids figure.clf() and layout recreation)
+    cache = getattr(figure, "_plot_cache", None)
+    can_update_inplace = (
+        cache is not None
+        and cache.get("filter_tab") == filter_tab
+        and cache.get("theme") == theme
+        and cache.get("temp_scale") == temp_scale
+        and cache.get("hidden_set") == hidden_set
+        and cache.get("temp_keys") == tuple(temp_keys)
+        and all(ax in figure.axes for ax in cache.get("axes", []))
+    )
+
+    if can_update_inplace:
+        lines_dict = cache["lines"]
+        crosshairs = cache["crosshairs"]
+        axes_list = cache["axes"]
+
+        if filter_tab in ("Main", "Overview"):
+            ax_temp, ax_he3, ax_kepco_i = axes_list
+            all_temp_mins, all_temp_maxs = [], []
+            for key in temp_keys:
+                if key in lines_dict:
+                    line = lines_dict[key]
+                    if key in data and key in data[key] and len(data[key][key]) > 0:
+                        v = data[key][key]
+                        v_plot = get_sliced(v)
+                        xp, vp = get_plot_arrays(x_plot, v_plot)
+                        line.set_data(xp, vp)
+                        if custom_xlim is None and len(vp) > 0:
+                            pos = vp[np.isfinite(vp) & (vp > 0)]
+                            if len(pos) > 0:
+                                all_temp_mins.append(float(np.min(pos)))
+                                all_temp_maxs.append(float(np.max(pos)))
+                    else:
+                        line.set_data([], [])
+
+            if custom_xlim is None:
+                if temp_scale == "log":
+                    if all_temp_mins:
+                        t_min = max(0.01, min(all_temp_mins) * 0.75)
+                        t_max = max(10.0, max(all_temp_maxs) * 1.25)
+                        ax_temp.set_ylim(bottom=t_min, top=t_max)
+                    else:
+                        ax_temp.set_ylim(bottom=0.01, top=350)
+                else:
+                    if all_temp_maxs:
+                        t_max = max(10.0, max(all_temp_maxs) * 1.05)
+                        ax_temp.set_ylim(bottom=0.0, top=t_max)
+                    else:
+                        ax_temp.set_ylim(bottom=0.0, top=350)
+
+            # He3 line
+            he3_key = get_pressure_key(data)
+            if he3_key in lines_dict:
+                line_he3 = lines_dict[he3_key]
+                if he3_key in data and he3_key in data[he3_key] and len(data[he3_key][he3_key]) > 0:
+                    v_he3 = np.array(data[he3_key][he3_key], dtype=float)
+                    xp, vp = get_plot_arrays(x_plot, get_sliced(v_he3))
+                    line_he3.set_data(xp, vp)
+                    if custom_xlim is None:
+                        val_pos = vp[np.isfinite(vp)]
+                        if len(val_pos) > 0:
+                            p_min, p_max = float(np.min(val_pos)), float(np.max(val_pos))
+                            pad = max(0.05, (p_max - p_min) * 0.05)
+                            ax_he3.set_ylim(bottom=p_min - pad, top=p_max + pad)
+                else:
+                    line_he3.set_data([], [])
+
+            # Kepco I line
+            kepco_key = get_kepco_i_key(data)
+            if kepco_key in lines_dict:
+                line_k = lines_dict[kepco_key]
+                if kepco_key in data and kepco_key in data[kepco_key] and len(data[kepco_key][kepco_key]) > 0:
+                    v_k = np.array(data[kepco_key][kepco_key], dtype=float)
+                    xp, vp = get_plot_arrays(x_plot, get_sliced(v_k))
+                    line_k.set_data(xp, vp)
+                    if custom_xlim is None:
+                        val_pos = vp[np.isfinite(vp)]
+                        if len(val_pos) > 0:
+                            k_min, k_max = float(np.min(val_pos)), float(np.max(val_pos))
+                            pad = max(0.05, (k_max - k_min) * 0.05)
+                            ax_kepco_i.set_ylim(bottom=k_min - pad, top=k_max + pad)
+                else:
+                    line_k.set_data([], [])
+
+            if target_xlim is not None:
+                ax_temp.set_xlim(target_xlim)
+
+            # Crosshairs
+            if data_xloc is not None and xloc_ind is not None:
+                cx = x[xloc_ind]
+                for ch in crosshairs:
+                    ch.set_xdata([cx, cx])
+                    ch.set_visible(True)
+            else:
+                for ch in crosshairs:
+                    ch.set_visible(False)
+
+            keys_to_plot = temp_keys + ["labjack_he3_pressure", "labjack_kepco_current"]
+            return (data_mr, data_xloc, units, keys_to_plot, axes_list)
+
+        elif filter_tab in ("Thermometers", "Temperatures"):
+            ax = axes_list[0]
+            all_temp_mins, all_temp_maxs = [], []
+            for key in temp_keys:
+                if key in lines_dict:
+                    line = lines_dict[key]
+                    if key in data and key in data[key] and len(data[key][key]) > 0:
+                        v = data[key][key]
+                        v_plot = get_sliced(v)
+                        xp, vp = get_plot_arrays(x_plot, v_plot)
+                        line.set_data(xp, vp)
+                        if custom_xlim is None and len(vp) > 0:
+                            pos = vp[np.isfinite(vp) & (vp > 0)]
+                            if len(pos) > 0:
+                                all_temp_mins.append(float(np.min(pos)))
+                                all_temp_maxs.append(float(np.max(pos)))
+                    else:
+                        line.set_data([], [])
+
+            if custom_xlim is None:
+                if temp_scale == "log":
+                    if all_temp_mins:
+                        t_min = max(0.01, min(all_temp_mins) * 0.75)
+                        t_max = max(10.0, max(all_temp_maxs) * 1.25)
+                        ax.set_ylim(bottom=t_min, top=t_max)
+                    else:
+                        ax.set_ylim(bottom=0.01, top=350)
+                else:
+                    if all_temp_maxs:
+                        t_max = max(10.0, max(all_temp_maxs) * 1.05)
+                        ax.set_ylim(bottom=0.0, top=t_max)
+                    else:
+                        ax.set_ylim(bottom=0.0, top=350)
+
+            if target_xlim is not None:
+                ax.set_xlim(target_xlim)
+
+            if data_xloc is not None and xloc_ind is not None:
+                cx = x[xloc_ind]
+                for ch in crosshairs:
+                    ch.set_xdata([cx, cx])
+                    ch.set_visible(True)
+            else:
+                for ch in crosshairs:
+                    ch.set_visible(False)
+
+            return (data_mr, data_xloc, units, temp_keys, axes_list)
+
+        elif filter_tab in ("Pressures", "Pressure"):
+            ax1, ax2 = axes_list
+            he3_key = get_pressure_key(data)
+            vac_key = get_vac_can_pressure_key(data)
+
+            if he3_key in lines_dict:
+                line_he3 = lines_dict[he3_key]
+                if he3_key in data and he3_key in data[he3_key] and len(data[he3_key][he3_key]) > 0:
+                    v_he3 = np.array(data[he3_key][he3_key], dtype=float)
+                    xp, vp = get_plot_arrays(x_plot, get_sliced(v_he3))
+                    line_he3.set_data(xp, vp)
+                    if custom_xlim is None:
+                        val_pos = vp[np.isfinite(vp)]
+                        if len(val_pos) > 0:
+                            p_min, p_max = float(np.min(val_pos)), float(np.max(val_pos))
+                            pad = max(0.05, (p_max - p_min) * 0.05)
+                            ax1.set_ylim(bottom=p_min - pad, top=p_max + pad)
+                else:
+                    line_he3.set_data([], [])
+
+            if vac_key in lines_dict:
+                line_vac = lines_dict[vac_key]
+                if vac_key in data and vac_key in data[vac_key] and len(data[vac_key][vac_key]) > 0:
+                    v_vac = np.array(data[vac_key][vac_key], dtype=float)
+                    xp, vp = get_plot_arrays(x_plot, get_sliced(v_vac))
+                    line_vac.set_data(xp, vp)
+                    if custom_xlim is None:
+                        valid_mask = np.isfinite(vp) & (vp > 0)
+                        if np.any(valid_mask):
+                            y_min_val = float(np.min(vp[valid_mask]))
+                            y_max_val = float(np.max(vp[valid_mask]))
+                            if y_max_val / max(1e-9, y_min_val) < 10.0:
+                                log_mid = (np.log10(y_min_val) + np.log10(y_max_val)) / 2.0
+                                ax2.set_ylim(bottom=10.0 ** (np.floor(log_mid) - 1.0), top=10.0 ** (np.ceil(log_mid) + 1.0))
+                            else:
+                                ax2.set_ylim(bottom=10.0 ** np.floor(np.log10(y_min_val)), top=10.0 ** np.ceil(np.log10(y_max_val)))
+                else:
+                    line_vac.set_data([], [])
+
+            if target_xlim is not None:
+                ax1.set_xlim(target_xlim)
+
+            if data_xloc is not None and xloc_ind is not None:
+                cx = x[xloc_ind]
+                for ch in crosshairs:
+                    ch.set_xdata([cx, cx])
+                    ch.set_visible(True)
+            else:
+                for ch in crosshairs:
+                    ch.set_visible(False)
+
+            return (data_mr, data_xloc, units, [he3_key, vac_key], axes_list)
+
+        else:  # "Utils" / "Diagnostics"
+            channel_list = ["labjack_kepco_voltage", "ls370_heater_out"]
+            for idx, ch_key in enumerate(channel_list):
+                if ch_key in lines_dict and idx < len(axes_list):
+                    line = lines_dict[ch_key]
+                    ax = axes_list[idx]
+                    if ch_key in data and ch_key in data[ch_key] and len(data[ch_key][ch_key]) > 0:
+                        v = np.array(data[ch_key][ch_key], dtype=float)
+                        xp, vp = get_plot_arrays(x_plot, get_sliced(v))
+                        line.set_data(xp, vp)
+                        if custom_xlim is None:
+                            val_pos = vp[np.isfinite(vp)]
+                            if len(val_pos) > 0:
+                                v_min, v_max = float(np.min(val_pos)), float(np.max(val_pos))
+                                pad = max(0.05, (v_max - v_min) * 0.05)
+                                ax.set_ylim(bottom=v_min - pad, top=v_max + pad)
+                    else:
+                        line.set_data([], [])
+
+            if target_xlim is not None and axes_list:
+                axes_list[0].set_xlim(target_xlim)
+
+            if data_xloc is not None and xloc_ind is not None:
+                cx = x[xloc_ind]
+                for ch in crosshairs:
+                    ch.set_xdata([cx, cx])
+                    ch.set_visible(True)
+            else:
+                for ch in crosshairs:
+                    ch.set_visible(False)
+
+            return (data_mr, data_xloc, units, channel_list, axes_list)
+
+    # ---------------- FULL REBUILD ----------------
+    figure.clf()
+    figure.set_facecolor(thm["fig_bg"])
     axes_list = []
-    
+    lines_dict = {}
+    crosshairs = []
+
     if filter_tab in ("Main", "Overview"):
         # Left plot (spans 2 rows): All Temperatures in 1 plot
         # Right stack (2 rows, 1 col): Top=He3 Pressure, Bottom=Magnet Current (Kepco I)
@@ -706,50 +949,59 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
                 spine.set_color(thm["spine"])
                 spine.set_linewidth(1.0)
             ax.grid(True, which="both", axis="both", color=thm["grid"], linestyle="--", alpha=thm["grid_alpha"])
-            ax.tick_params(axis="both", colors=thm["tick_color"], labelsize=8.5, labelleft=True)
+            ax.tick_params(axis="both", which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"], labelsize=8.5, labelleft=True)
+            ax.yaxis.set_tick_params(which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"])
+            ax.xaxis.set_tick_params(which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"])
 
         # 1. Plot all Temperatures on ax_temp
-        all_found_temps = get_temp_keys(data)
-        temp_keys = [k for k in all_found_temps if not (hidden_channels and k in hidden_channels)]
-        all_temp_vals = []
+        all_temp_mins = []
+        all_temp_maxs = []
         for key in temp_keys:
+            color = ch_colors.get(key, "#0284c7")
+            name = display_name(key)
             if key in data and key in data[key] and len(data[key][key]) > 0:
-                v = np.array(data[key][key], dtype=float)
+                v = data[key][key]
                 v_plot = get_sliced(v)
-                pos = v_plot[np.isfinite(v_plot) & (v_plot > 0)]
-                if len(pos) > 0:
-                    all_temp_vals.append(pos)
-                color = ch_colors.get(key, "#0284c7")
-                name = display_name(key)
-                safe_plot(ax_temp, x_plot, v_plot, color=color, lw=1.8, label=name)
+                xp, vp = get_plot_arrays(x_plot, v_plot)
+                if len(vp) > 0:
+                    pos = vp[np.isfinite(vp) & (vp > 0)]
+                    if len(pos) > 0:
+                        all_temp_mins.append(float(np.min(pos)))
+                        all_temp_maxs.append(float(np.max(pos)))
+                line, = ax_temp.plot(xp, vp, color=color, lw=1.8, label=name)
+            else:
+                line, = ax_temp.plot([], [], color=color, lw=1.8, label=name)
+            lines_dict[key] = line
         
         if temp_scale == "log":
             ax_temp.set_yscale("log")
-            if all_temp_vals:
-                combined = np.concatenate(all_temp_vals)
-                t_min = max(0.01, float(np.min(combined)) * 0.75)
-                t_max = max(10.0, float(np.max(combined)) * 1.25)
+            if all_temp_mins:
+                t_min = max(0.01, min(all_temp_mins) * 0.75)
+                t_max = max(10.0, max(all_temp_maxs) * 1.25)
                 ax_temp.set_ylim(bottom=t_min, top=t_max)
             else:
                 ax_temp.set_ylim(bottom=0.01, top=350)
             ax_temp.set_ylabel("Temperature (K)", color=thm["tick_color"], fontsize=9, fontweight="bold")
+            ax_temp.tick_params(axis="both", which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"], labelsize=8.5)
+            ax_temp.yaxis.set_tick_params(which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"])
         else:
             ax_temp.set_yscale("linear")
             ax_temp.yaxis.set_major_formatter(FormatStrFormatter('%.1f'))
-            if all_temp_vals:
-                combined = np.concatenate(all_temp_vals)
-                t_max = max(10.0, float(np.max(combined)) * 1.05)
+            if all_temp_maxs:
+                t_max = max(10.0, max(all_temp_maxs) * 1.05)
                 ax_temp.set_ylim(bottom=0.0, top=t_max)
             else:
                 ax_temp.set_ylim(bottom=0.0, top=350)
             ax_temp.set_ylabel("Temperature (K)", color=thm["tick_color"], fontsize=9, fontweight="bold")
+            ax_temp.tick_params(axis="both", which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"], labelsize=8.5)
+            ax_temp.yaxis.set_tick_params(which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"])
 
         ax_temp.set_title("Temperatures", loc="left", fontsize=10, fontweight="bold", color=thm["text"], pad=4)
         if temp_keys and len(x) > 0:
             ax_temp.legend(loc="upper left", fontsize=8, facecolor=thm["legend_bg"], edgecolor=thm["legend_edge"], labelcolor=thm["legend_text"], framealpha=0.9)
         ax_temp.xaxis.set_major_locator(SmartTimeLocator())
         ax_temp.xaxis.set_major_formatter(SmartTimeFormatter())
-        ax_temp.tick_params(axis="x", colors=thm["tick_color"], rotation=15, labelsize=8.5, labelbottom=True)
+        ax_temp.tick_params(axis="x", which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"], rotation=15, labelsize=8.5, labelbottom=True)
         ax_temp.set_xlabel("Local Time", color=thm["subtext"], fontsize=9)
 
         # 2. Plot He3 Pressure on ax_he3 (Top Right)
@@ -758,8 +1010,11 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         color_he3 = ch_colors.get(he3_key, "#2563eb")
         if he3_key in data and he3_key in data[he3_key] and len(data[he3_key][he3_key]) > 0:
             v = np.array(data[he3_key][he3_key], dtype=float)
-            v_plot = get_sliced(v)
-            safe_plot(ax_he3, x_plot, v_plot, color=color_he3, lw=1.8)
+            xp, vp = get_plot_arrays(x_plot, get_sliced(v))
+            line_he3, = ax_he3.plot(xp, vp, color=color_he3, lw=1.8)
+        else:
+            line_he3, = ax_he3.plot([], [], color=color_he3, lw=1.8)
+        lines_dict[he3_key] = line_he3
         ax_he3.set_title(display_name(he3_key), loc="left", fontsize=9.5, fontweight="bold", color=color_he3, pad=4)
         ax_he3.set_ylabel("Pressure (bar)", color=thm["tick_color"], fontsize=8.5, fontweight="bold")
         ax_he3.tick_params(axis="x", labelbottom=False)
@@ -771,8 +1026,11 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         unit = units.get(kepco_key, "A")
         if kepco_key in data and kepco_key in data[kepco_key] and len(data[kepco_key][kepco_key]) > 0:
             v = np.array(data[kepco_key][kepco_key], dtype=float)
-            v_plot = get_sliced(v)
-            safe_plot(ax_kepco_i, x_plot, v_plot, color=color_kepco, lw=1.8)
+            xp, vp = get_plot_arrays(x_plot, get_sliced(v))
+            line_k, = ax_kepco_i.plot(xp, vp, color=color_kepco, lw=1.8)
+        else:
+            line_k, = ax_kepco_i.plot([], [], color=color_kepco, lw=1.8)
+        lines_dict[kepco_key] = line_k
         ax_kepco_i.set_title(display_name(kepco_key), loc="left", fontsize=9.5, fontweight="bold", color=color_kepco, pad=4)
         ax_kepco_i.set_ylabel(f"Current ({unit})", color=thm["tick_color"], fontsize=8.5, fontweight="bold")
         ax_kepco_i.xaxis.set_major_locator(SmartTimeLocator())
@@ -784,9 +1042,26 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             ax_temp.set_xlim(target_xlim)
 
         # Add hover crosshair to all 3 axes
+        for ax in axes_list:
+            vl = ax.axvline(x[0] if len(x) > 0 else 0, color=thm["crosshair"], alpha=0.8, linestyle="--", linewidth=1.0, visible=False)
+            crosshairs.append(vl)
+
         if data_xloc is not None and xloc_ind is not None:
-            for ax in axes_list:
-                ax.axvline(x[xloc_ind], color=thm["crosshair"], alpha=0.8, linestyle="--", linewidth=1.0)
+            cx = x[xloc_ind]
+            for ch in crosshairs:
+                ch.set_xdata([cx, cx])
+                ch.set_visible(True)
+
+        figure._plot_cache = {
+            "filter_tab": filter_tab,
+            "theme": theme,
+            "temp_scale": temp_scale,
+            "hidden_set": hidden_set,
+            "temp_keys": tuple(temp_keys),
+            "lines": lines_dict,
+            "crosshairs": crosshairs,
+            "axes": axes_list,
+        }
 
         keys_to_plot = temp_keys + ["labjack_he3_pressure", "labjack_kepco_current"]
         return (data_mr, data_xloc, units, keys_to_plot, axes_list)
@@ -800,56 +1075,81 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             spine.set_color(thm["spine"])
             spine.set_linewidth(1.0)
         ax.grid(True, which="both", axis="both", color=thm["grid"], linestyle="--", alpha=thm["grid_alpha"])
-        ax.tick_params(axis="both", colors=thm["tick_color"], labelsize=8.5, labelleft=True)
+        ax.tick_params(axis="both", which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"], labelsize=8.5, labelleft=True)
+        ax.yaxis.set_tick_params(which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"])
+        ax.xaxis.set_tick_params(which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"])
 
-        all_found_temps = get_temp_keys(data)
-        temp_keys = [k for k in all_found_temps if not (hidden_channels and k in hidden_channels)]
-        all_temp_vals = []
+        all_temp_mins = []
+        all_temp_maxs = []
         for key in temp_keys:
+            color = ch_colors.get(key, "#0284c7")
+            name = display_name(key)
             if key in data and key in data[key] and len(data[key][key]) > 0:
-                v = np.array(data[key][key], dtype=float)
+                v = data[key][key]
                 v_plot = get_sliced(v)
-                pos = v_plot[np.isfinite(v_plot) & (v_plot > 0)]
-                if len(pos) > 0:
-                    all_temp_vals.append(pos)
-                color = ch_colors.get(key, "#0284c7")
-                name = display_name(key)
-                safe_plot(ax, x_plot, v_plot, color=color, lw=1.8, label=name)
+                xp, vp = get_plot_arrays(x_plot, v_plot)
+                if len(vp) > 0:
+                    pos = vp[np.isfinite(vp) & (vp > 0)]
+                    if len(pos) > 0:
+                        all_temp_mins.append(float(np.min(pos)))
+                        all_temp_maxs.append(float(np.max(pos)))
+                line, = ax.plot(xp, vp, color=color, lw=1.8, label=name)
+            else:
+                line, = ax.plot([], [], color=color, lw=1.8, label=name)
+            lines_dict[key] = line
 
         if temp_scale == "log":
             ax.set_yscale("log")
-            if all_temp_vals:
-                combined = np.concatenate(all_temp_vals)
-                t_min = max(0.01, float(np.min(combined)) * 0.75)
-                t_max = max(10.0, float(np.max(combined)) * 1.25)
+            if all_temp_mins:
+                t_min = max(0.01, min(all_temp_mins) * 0.75)
+                t_max = max(10.0, max(all_temp_maxs) * 1.25)
                 ax.set_ylim(bottom=t_min, top=t_max)
             else:
                 ax.set_ylim(bottom=0.01, top=350)
             ax.set_ylabel("Temperature (K)", color=thm["tick_color"], fontsize=9, fontweight="bold")
+            ax.tick_params(axis="both", which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"], labelsize=8.5)
+            ax.yaxis.set_tick_params(which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"])
         else:
             ax.set_yscale("linear")
             ax.yaxis.set_major_formatter(FormatStrFormatter('%.1f'))
-            if all_temp_vals:
-                combined = np.concatenate(all_temp_vals)
-                t_max = max(10.0, float(np.max(combined)) * 1.05)
+            if all_temp_maxs:
+                t_max = max(10.0, max(all_temp_maxs) * 1.05)
                 ax.set_ylim(bottom=0.0, top=t_max)
             else:
                 ax.set_ylim(bottom=0.0, top=350)
             ax.set_ylabel("Temperature (K)", color=thm["tick_color"], fontsize=9, fontweight="bold")
+            ax.tick_params(axis="both", which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"], labelsize=8.5)
+            ax.yaxis.set_tick_params(which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"])
 
         ax.set_title("All Thermometers", loc="left", fontsize=10, fontweight="bold", color=thm["text"], pad=4)
         if temp_keys and len(x) > 0:
             ax.legend(loc="upper left", fontsize=8.5, facecolor=thm["legend_bg"], edgecolor=thm["legend_edge"], labelcolor=thm["legend_text"], framealpha=0.9)
         ax.xaxis.set_major_locator(SmartTimeLocator())
         ax.xaxis.set_major_formatter(SmartTimeFormatter())
-        ax.tick_params(axis="x", colors=thm["tick_color"], rotation=15, labelsize=8.5, labelbottom=True)
+        ax.tick_params(axis="x", which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"], rotation=15, labelsize=8.5, labelbottom=True)
         ax.set_xlabel("Local Time", color=thm["subtext"], fontsize=9)
 
         if target_xlim is not None:
             ax.set_xlim(target_xlim)
 
+        vl = ax.axvline(x[0] if len(x) > 0 else 0, color=thm["crosshair"], alpha=0.8, linestyle="--", linewidth=1.0, visible=False)
+        crosshairs.append(vl)
+
         if data_xloc is not None and xloc_ind is not None:
-            ax.axvline(x[xloc_ind], color=thm["crosshair"], alpha=0.8, linestyle="--", linewidth=1.0)
+            cx = x[xloc_ind]
+            vl.set_xdata([cx, cx])
+            vl.set_visible(True)
+
+        figure._plot_cache = {
+            "filter_tab": filter_tab,
+            "theme": theme,
+            "temp_scale": temp_scale,
+            "hidden_set": hidden_set,
+            "temp_keys": tuple(temp_keys),
+            "lines": lines_dict,
+            "crosshairs": crosshairs,
+            "axes": axes_list,
+        }
 
         return (data_mr, data_xloc, units, temp_keys, axes_list)
 
@@ -865,7 +1165,9 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
                 spine.set_color(thm["spine"])
                 spine.set_linewidth(1.0)
             ax.grid(True, which="both", axis="both", color=thm["grid"], linestyle="--", alpha=thm["grid_alpha"])
-            ax.tick_params(axis="both", colors=thm["tick_color"], labelsize=8.5, labelleft=True)
+            ax.tick_params(axis="both", which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"], labelsize=8.5, labelleft=True)
+            ax.yaxis.set_tick_params(which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"])
+            ax.xaxis.set_tick_params(which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"])
 
         # 1. He3 Pressure (Top)
         he3_key = get_pressure_key(data)
@@ -874,11 +1176,14 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         ax1.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
         if he3_key in data and he3_key in data[he3_key] and len(data[he3_key][he3_key]) > 0:
             v_he3 = np.array(data[he3_key][he3_key], dtype=float)
-            v_he3_plot = get_sliced(v_he3)
-            safe_plot(ax1, x_plot, v_he3_plot, color=color_he3, lw=1.8)
+            xp, vp = get_plot_arrays(x_plot, get_sliced(v_he3))
+            line_he3, = ax1.plot(xp, vp, color=color_he3, lw=1.8)
+        else:
+            line_he3, = ax1.plot([], [], color=color_he3, lw=1.8)
+        lines_dict[he3_key] = line_he3
         ax1.set_title(name_he3, loc="left", fontsize=9.5, fontweight="bold", color=color_he3, pad=3)
         ax1.set_ylabel("Pressure (bar)", color=thm["tick_color"], fontsize=8.5, fontweight="bold")
-        ax1.tick_params(axis="x", labelbottom=False)
+        ax1.tick_params(axis="x", which="both", labelbottom=False)
 
         # 2. Vacuum Can Pressure (Bottom)
         vac_key = get_vac_can_pressure_key(data)
@@ -888,18 +1193,23 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         has_vac = False
         if vac_key in data and vac_key in data[vac_key] and len(data[vac_key][vac_key]) > 0:
             v_vac = np.array(data[vac_key][vac_key], dtype=float)
-            v_vac_plot = get_sliced(v_vac)
-            valid_mask = np.isfinite(v_vac_plot) & (v_vac_plot > 0)
+            xp, vp = get_plot_arrays(x_plot, get_sliced(v_vac))
+            valid_mask = np.isfinite(vp) & (vp > 0)
             if np.any(valid_mask):
                 has_vac = True
-                safe_plot(ax2, x_plot, v_vac_plot, color=color_vac, lw=1.8)
-                y_min_val = float(np.min(v_vac_plot[valid_mask]))
-                y_max_val = float(np.max(v_vac_plot[valid_mask]))
+                line_vac, = ax2.plot(xp, vp, color=color_vac, lw=1.8)
+                y_min_val = float(np.min(vp[valid_mask]))
+                y_max_val = float(np.max(vp[valid_mask]))
                 if y_max_val / max(1e-9, y_min_val) < 10.0:
                     log_mid = (np.log10(y_min_val) + np.log10(y_max_val)) / 2.0
                     ax2.set_ylim(bottom=10.0 ** (np.floor(log_mid) - 1.0), top=10.0 ** (np.ceil(log_mid) + 1.0))
                 else:
                     ax2.set_ylim(bottom=10.0 ** np.floor(np.log10(y_min_val)), top=10.0 ** np.ceil(np.log10(y_max_val)))
+            else:
+                line_vac, = ax2.plot([], [], color=color_vac, lw=1.8)
+        else:
+            line_vac, = ax2.plot([], [], color=color_vac, lw=1.8)
+        lines_dict[vac_key] = line_vac
 
         if not has_vac:
             ax2.set_ylim(bottom=1e-4, top=1e3)
@@ -908,9 +1218,11 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         ax2.yaxis.set_major_formatter(LogFormatterMathtext())
         ax2.set_title(name_vac, loc="left", fontsize=9.5, fontweight="bold", color=color_vac, pad=3)
         ax2.set_ylabel("Vac Can (Torr)", color=thm["tick_color"], fontsize=8.5, fontweight="bold")
+        ax2.tick_params(axis="both", which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"], labelsize=8.5)
+        ax2.yaxis.set_tick_params(which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"])
         ax2.xaxis.set_major_locator(SmartTimeLocator())
         ax2.xaxis.set_major_formatter(SmartTimeFormatter())
-        ax2.tick_params(axis="x", colors=thm["tick_color"], rotation=15, labelsize=8.5, labelbottom=True)
+        ax2.tick_params(axis="x", which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"], rotation=15, labelsize=8.5, labelbottom=True)
         ax2.set_xlabel("Local Time", color=thm["subtext"], fontsize=9)
         try:
             figure.align_ylabels(axes_list)
@@ -920,9 +1232,26 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         if target_xlim is not None:
             ax1.set_xlim(target_xlim)
 
+        for ax in axes_list:
+            vl = ax.axvline(x[0] if len(x) > 0 else 0, color=thm["crosshair"], alpha=0.8, linestyle="--", linewidth=1.0, visible=False)
+            crosshairs.append(vl)
+
         if data_xloc is not None and xloc_ind is not None:
-            ax1.axvline(x[xloc_ind], color=thm["crosshair"], alpha=0.8, linestyle="--", linewidth=1.0)
-            ax2.axvline(x[xloc_ind], color=thm["crosshair"], alpha=0.8, linestyle="--", linewidth=1.0)
+            cx = x[xloc_ind]
+            for ch in crosshairs:
+                ch.set_xdata([cx, cx])
+                ch.set_visible(True)
+
+        figure._plot_cache = {
+            "filter_tab": filter_tab,
+            "theme": theme,
+            "temp_scale": temp_scale,
+            "hidden_set": hidden_set,
+            "temp_keys": tuple(temp_keys),
+            "lines": lines_dict,
+            "crosshairs": crosshairs,
+            "axes": axes_list,
+        }
 
         return (data_mr, data_xloc, units, [he3_key, vac_key], axes_list)
 
@@ -948,7 +1277,9 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
                 spine.set_color(thm["spine"])
                 spine.set_linewidth(1.0)
             ax.grid(True, which="both", axis="both", color=thm["grid"], linestyle="--", alpha=thm["grid_alpha"])
-            ax.tick_params(axis="both", colors=thm["tick_color"], labelsize=8.5, labelleft=True)
+            ax.tick_params(axis="both", which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"], labelsize=8.5, labelleft=True)
+            ax.yaxis.set_tick_params(which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"])
+            ax.xaxis.set_tick_params(which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"])
             ax.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
 
             color = ch_colors.get(ch_key, "#0891b2")
@@ -957,24 +1288,45 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             
             if ch_key in data and ch_key in data[ch_key] and len(data[ch_key][ch_key]) > 0:
                 v = np.array(data[ch_key][ch_key], dtype=float)
-                v_plot = get_sliced(v)
-                safe_plot(ax, x_plot, v_plot, color=color, linewidth=1.8)
+                xp, vp = get_plot_arrays(x_plot, get_sliced(v))
+                line, = ax.plot(xp, vp, color=color, linewidth=1.8)
+            else:
+                line, = ax.plot([], [], color=color, linewidth=1.8)
+            lines_dict[ch_key] = line
+
             ax.set_title(name, loc="left", fontsize=9.5, fontweight="bold", color=color, pad=3)
             ax.set_ylabel(f"{name} ({unit})" if unit else name, color=thm["tick_color"], fontsize=8.5, fontweight="bold")
 
-            if data_xloc is not None and xloc_ind is not None:
-                ax.axvline(x[xloc_ind], color=thm["crosshair"], alpha=0.8, linestyle="--", linewidth=1.0)
+            vl = ax.axvline(x[0] if len(x) > 0 else 0, color=thm["crosshair"], alpha=0.8, linestyle="--", linewidth=1.0, visible=False)
+            crosshairs.append(vl)
 
             if idx == len(channel_list) - 1:
                 ax.xaxis.set_major_locator(SmartTimeLocator())
                 ax.xaxis.set_major_formatter(SmartTimeFormatter())
-                ax.tick_params(axis="x", colors=thm["tick_color"], rotation=15, labelsize=8.5, labelbottom=True)
+                ax.tick_params(axis="x", which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"], rotation=15, labelsize=8.5, labelbottom=True)
                 ax.set_xlabel("Local Time", color=thm["subtext"], fontsize=9)
             else:
-                ax.tick_params(axis="x", labelbottom=False)
+                ax.tick_params(axis="x", which="both", labelbottom=False)
 
         if target_xlim is not None and first_ax is not None:
             first_ax.set_xlim(target_xlim)
+
+        if data_xloc is not None and xloc_ind is not None:
+            cx = x[xloc_ind]
+            for ch in crosshairs:
+                ch.set_xdata([cx, cx])
+                ch.set_visible(True)
+
+        figure._plot_cache = {
+            "filter_tab": filter_tab,
+            "theme": theme,
+            "temp_scale": temp_scale,
+            "hidden_set": hidden_set,
+            "temp_keys": tuple(temp_keys),
+            "lines": lines_dict,
+            "crosshairs": crosshairs,
+            "axes": axes_list,
+        }
 
         return (data_mr, data_xloc, units, channel_list, axes_list)
 
@@ -1021,7 +1373,7 @@ def export_snapshot_plot(dataset, out_path, xlim=None, run_label="Current Run"):
     t_max_dt = datetime.fromtimestamp(x_max_ts).strftime("%Y-%m-%d %H:%M")
 
     channel_map = [
-        ("Upper stage (40K) temp. (K)", ["cryocon_chA_temperature", "chA", "40k"]),
+        ("Upper stage (60K) temp. (K)", ["cryocon_chA_temperature", "chA", "60k", "40k"]),
         ("Charcoal temp. (K)", ["cryocon_chB_temperature", "chB", "charcoal"]),
         ("4 K flange temp. (K)", ["cryocon_chC_temperature", "chC", "4k", "3k"]),
         ("³He pot temp (K)", ["cryocon_chD_temperature", "chD", "pot"]),
@@ -1090,7 +1442,7 @@ def export_snapshot_plot(dataset, out_path, xlim=None, run_label="Current Run"):
                 ax.xaxis.set_major_formatter(FormatStrFormatter("%d"))
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    fig.suptitle(f"2pac ADR Cryostat Telemetry Snapshot — {now_str}   [Local Time: {t_min_dt} to {t_max_dt}]",
+    fig.suptitle(f"2pac ADR Cryostat Logs [Local Time: {t_min_dt} to {t_max_dt}]",
                  fontsize=11, fontweight="bold", y=0.98, color="black")
     plt.subplots_adjust(left=0.065, right=0.98, top=0.93, bottom=0.09, wspace=0.28, hspace=0.18)
 

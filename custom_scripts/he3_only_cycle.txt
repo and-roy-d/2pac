@@ -1,5 +1,5 @@
 # He3 Condensation Cycle (No Magnet / No ADR)
-# 1. Close heatswitches pot & adr, open charcoal, wait until pot < 3.2K
+# 1. Close heatswitches pot & adr, open charcoal, wait until 3K starting temp < 3.2K
 print("CLOSE THE GREEN HE3 VALVE")
 close heatswitch pot
 wait 1 s
@@ -10,7 +10,7 @@ wait 1 s
 
 while True:
     mr = most_recent_measurements()
-    if mr.get("cryocon_chD_temperature", 100) < 3.2 or mr.get("cryocon_chC_temperature", 100) < 3.2:
+    if mr.get("cryocon_chC_temperature", 100) < 3.2:
         break
     world.wait(1)
 
@@ -21,6 +21,8 @@ world.station.cryocon.loop1_setpoint(65)
 world.wait(1)
 world.station.cryocon.loop2_source("B")
 world.wait(1)
+world.station.cryocon.loop2_range("HI")
+world.wait(1)
 world.station.cryocon.loop2_setpoint(55)
 world.wait(1)
 world.station.cryocon.control_enabled(True)
@@ -29,24 +31,18 @@ world.wait(1)
 # 3. Wait for He3 to condense (3.5 hours)
 world.wait(12600)
 
-# 4. Cool charcoal
+# 4. Cool charcoal to base temperature (< 1.0 K)
 open heatswitch pot
 world.wait(1)
 world.station.cryocon.control_enabled(False)
 world.wait(120)
 close heatswitch charcoal
 world.wait(1)
-world.wait(3600)
 
-world.station.cryocon.loop1_setpoint(65)
-world.wait(1)
-world.station.cryocon.loop2_source("B")
-world.wait(1)
-world.station.cryocon.loop2_setpoint(1)
-world.wait(1)
-world.station.cryocon.control_enabled(True)
-world.wait(1800)
-world.station.cryocon.control_enabled(False)
-world.wait(7200)
+while True:
+    mr = most_recent_measurements()
+    if mr.get("faa_temperature", 100) < 1.0 or mr.get("cryocon_chD_temperature", 100) < 1.0:
+        break
+    world.wait(1)
 
 return wait_forever

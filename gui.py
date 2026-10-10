@@ -1,4 +1,6 @@
 import sys
+import os
+import re
 import time
 import json
 import sqlite3
@@ -7,13 +9,13 @@ import threading
 from pathlib import Path
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QComboBox, QTextEdit, QLabel, QHBoxLayout,
-                             QPushButton, QTabWidget, QMessageBox, QFileDialog, QGridLayout, QLineEdit,
+                             QPushButton, QTabWidget, QTabBar, QMessageBox, QFileDialog, QGridLayout, QLineEdit,
                              QScrollArea, QFrame, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView,
                              QListWidget, QListWidgetItem, QCheckBox, QSpinBox, QDoubleSpinBox, QFormLayout,
                              QProgressBar)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
-from PyQt5.QtGui import QFont, QColor, QTextCursor, QTextCharFormat, QIcon
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT
+from PyQt5.QtGui import QFont, QColor, QTextCursor, QTextCharFormat, QTextFormat, QIcon
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -23,7 +25,7 @@ from plot_utils import plot_dataset, CHANNEL_ALIASES, CHANNEL_COLORS, display_na
 SETTINGS_PATH = Path.home() / "2pac_logs" / "channel_aliases.json"
 
 DEFAULT_CHANNEL_ALIASES = {
-    "cryocon_chA_temperature": "40K flange",
+    "cryocon_chA_temperature": "60K flange",
     "cryocon_chB_temperature": "Charcoal",
     "cryocon_chC_temperature": "4K flange",
     "cryocon_chD_temperature": "Pot",
@@ -47,6 +49,8 @@ STATE_LABELS = {
     "ready_for_cooldown": "Ready for Cooldown",
     "he3_only_cycle": "He-3 Cycle (No Magnet)",
     "he3_adr_cycle": "He-3 + ADR Cycle",
+    "resume_he3_adr_cycle": "Resume He-3 + ADR Cycle",
+    "regulate_temperature": "Regulate Temperature",
     "ramp_down_magnet": "Ramp Down Magnet",
     "warmup_300K": "Warm Up to 300 K",
     "open_adr_heatswitch": "Open ADR Heat Switch",
@@ -60,9 +64,16 @@ STATE_DESCRIPTIONS = {
     "ready_for_cooldown": "Closes all heat switches and sets He-3 setpoints (heaters off).\n"
                           "You will be asked to open the green He-3 valve.",
     "he3_only_cycle": "He-3 condensation cycle (no magnet / no ADR):\n"
-                      "Waits for Pot < 3.2 K, heats charcoal (55 K), dwells 3.5 h, and cools charcoal to reach ~300 mK.",
-    "he3_adr_cycle": "Full He-3 / ADR cycle (several hours): heats charcoal, ramps magnet up, "
-                     "condenses He-3, then ramps magnet down.\nWaits until Pot < 3.2 K before starting.",
+                      "Waits for 3K starting temp < 3.2 K, heats charcoal (55 K), dwells 3.5 h, and cools charcoal to launch/base temp (< 1.0 K).",
+    "he3_adr_cycle": "Full He-3 / ADR cycle (~8 h total):\n"
+                     "1. Pre-cool check: Verifies 3K starting temp (Ch C) < 3.2 K.\n"
+                     "2. Heat charcoal (55 K) & RAMP MAGNET UP (0 -> 58.1%, 45 min) with ADR switch closed.\n"
+                     "3. Condense He-3: 3.5 h dwell holding charcoal hot & magnet at full field.\n"
+                     "4. Cool charcoal: Pumps He-3 until FAA reaches launch temperature (< 1.0 K).\n"
+                     "5. RAMP MAGNET DOWN (Demag, 58.1% -> 0%, 45 min) with ADR switch open to reach base / regulate.",
+    "resume_he3_adr_cycle": "Resume in-progress He-3 / ADR cycle during condensation dwell:\n"
+                            "Maintains full field on magnet, verifies heat switches and Cryo-con loops, completes remaining condensation time, cools to launch temp (< 1.0 K), and demags down to base regulation.",
+    "regulate_temperature": "Sets relay to CONTROL and regulates temperature at target setpoint using Lake Shore 370 closed PID loop.",
     "ramp_down_magnet": "Safely ramps the magnet current from its current level down to 0 A at the standard safe rate.",
     "warmup_300K": "Closes all heat switches and warms the cryostat to 295 K.\n"
                    "You will be asked to open the green He-3 valve.",
@@ -74,6 +85,8 @@ SIMPLE_WORKFLOW = [
     "ready_for_cooldown",
     "he3_only_cycle",
     "he3_adr_cycle",
+    "resume_he3_adr_cycle",
+    "regulate_temperature",
     "ramp_down_magnet",
     "warmup_300K",
 ]
@@ -111,17 +124,35 @@ DEFAULT_GUI_SETTINGS = {
     "default_range": "6 Hours",
     "text_logs": True,
     "theme": "light",
+    "adr_config": {
+        "charcoal_heat_sp": 55.0,
+        "flange_60k_heat_sp": 65.0,
+        "starting_temp_3k": 3.2,
+        "pot_precool_limit_k": 3.2,
+        "he3_condense_dwell_h": 3.5,
+        "launch_temp_k": 1.0,
+        "launch_dwell_min": 10.0,
+        "magnet_max_hout": 58.1,
+        "magnet_ramp_up_min": 45.0,
+        "magnet_ramp_down_min": 60.0,
+        "demag_settle_min": 20.0,
+        "regulate_temp_mk": 50.0,
+        "regulate_temp_k": 0.050,
+    }
 }
 
 
 def load_gui_settings():
     settings = dict(DEFAULT_GUI_SETTINGS)
+    settings["adr_config"] = dict(DEFAULT_GUI_SETTINGS["adr_config"])
     try:
         if GUI_SETTINGS_PATH.exists():
             with open(GUI_SETTINGS_PATH) as f:
                 saved = json.load(f)
             for k, v in saved.items():
-                if k in settings and isinstance(v, type(settings[k])) or (k in settings and isinstance(settings[k], float) and isinstance(v, int)):
+                if k == "adr_config" and isinstance(v, dict):
+                    settings["adr_config"].update(v)
+                elif k in settings and isinstance(v, type(settings[k])) or (k in settings and isinstance(settings[k], float) and isinstance(v, int)):
                     settings[k] = v
     except Exception as e:
         print(f"Could not read GUI settings, using defaults: {e}")
@@ -195,6 +226,25 @@ QTabBar::tab:hover:!selected {
     color: #f8fafc;
     background-color: #1e293b;
 }
+QTabBar#plot_view_tabs::tab {
+    padding: 4px 12px;
+    border: 1px solid #1e293b;
+    border-radius: 4px;
+    background-color: #111827;
+    color: #94a3b8;
+    font-weight: 500;
+    margin-right: 3px;
+}
+QTabBar#plot_view_tabs::tab:selected {
+    background-color: #1e293b;
+    color: #38bdf8;
+    border: 1px solid #38bdf8;
+    font-weight: 600;
+}
+QTabBar#plot_view_tabs::tab:hover:!selected {
+    background-color: #1e293b;
+    color: #f8fafc;
+}
 QPushButton {
     background-color: #1e293b;
     color: #f8fafc;
@@ -249,6 +299,7 @@ QComboBox, QLineEdit {
     border-radius: 4px;
     padding: 4px 8px;
 }
+QComboBox:focus, QLineEdit:focus {
 QComboBox:focus, QLineEdit:focus {
     border-color: #38bdf8;
 }
@@ -382,7 +433,6 @@ QLabel#section_header {
 }
 QLabel#muted_label {
     color: #64748b;
-    font-size: 11px;
 }
 QTabWidget::pane {
     border: 1px solid #e2e8f0;
@@ -410,6 +460,25 @@ QTabBar::tab:selected {
 QTabBar::tab:hover:!selected {
     color: #0f172a;
     background-color: #e2e8f0;
+}
+QTabBar#plot_view_tabs::tab {
+    padding: 4px 12px;
+    border: 1px solid #cbd5e1;
+    border-radius: 4px;
+    background-color: #f1f5f9;
+    color: #64748b;
+    font-weight: 500;
+    margin-right: 3px;
+}
+QTabBar#plot_view_tabs::tab:selected {
+    background-color: #ffffff;
+    color: #0284c7;
+    border: 1px solid #0284c7;
+    font-weight: 600;
+}
+QTabBar#plot_view_tabs::tab:hover:!selected {
+    background-color: #e2e8f0;
+    color: #0f172a;
 }
 QPushButton {
     background-color: #ffffff;
@@ -644,32 +713,22 @@ def get_arrow_char_index(s2, plus=0):
     return 0
 
 def color_line(textedit, line_number, color=None, theme="light"):
-    if color is None:
-        color = QColor(224, 242, 254) if theme == "light" else QColor(30, 58, 138)
-
-    doc = textedit.document()
-    if line_number < 0 or line_number >= doc.blockCount():
+    """Instantly highlight active execution line using native Qt ExtraSelections without blocking text traversal."""
+    if not hasattr(textedit, "setExtraSelections") or line_number is None or line_number < 0:
         return
-
-    cursor = QTextCursor(doc)
-    cursor.beginEditBlock()
-
-    block = doc.firstBlock()
-    while block.isValid():
-        block_cursor = QTextCursor(block)
-        block_cursor.select(QTextCursor.LineUnderCursor)
-        block_cursor.setCharFormat(QTextCharFormat())
-        block = block.next()
-
-    cursor.endEditBlock()
-
+    doc = textedit.document()
+    if line_number >= doc.blockCount():
+        return
     block = doc.findBlockByNumber(line_number)
     cursor = QTextCursor(block)
-    fmt = QTextCharFormat()
-    fmt.setBackground(color)
-    fmt.setForeground(QColor(2, 132, 199) if theme == "light" else QColor(56, 189, 248))
-    cursor.select(QTextCursor.LineUnderCursor)
-    cursor.setCharFormat(fmt)
+
+    sel = QTextEdit.ExtraSelection()
+    if color is None:
+        color = QColor(224, 242, 254) if theme == "light" else QColor(30, 58, 138)
+    sel.format.setBackground(color)
+    sel.format.setProperty(QTextFormat.FullWidthSelection, True)
+    sel.cursor = cursor
+    textedit.setExtraSelections([sel])
 
 
 class DataFetchThread(QThread):
@@ -731,7 +790,7 @@ class DataFetchThread(QThread):
                         self.state_update.emit(s1, state.code_highlighted(line_number))
 
                     if hasattr(self.world, "command") and self.world.command is not None:
-                        from world import WaitUntil
+                        from engine import WaitUntil
                         if isinstance(self.world.command, WaitUntil):
                             self.world.command.time_s += (time.time() - pause_start)
 
@@ -824,8 +883,8 @@ class MyApp(QWidget):
         self._latest_magnet_current = 0.0
 
         # Mechanical heat switch state tracking (Pot, ADR, Charcoal)
-        # Default all to CLOSED because cooldown script is actively running
-        self._hs_states = {"pot": "CLOSED", "adr": "CLOSED", "charcoal": "CLOSED"}
+        # Default condensation configuration: Charcoal OPEN, Pot CLOSED, ADR CLOSED
+        self._hs_states = {"pot": "CLOSED", "adr": "CLOSED", "charcoal": "OPEN"}
         self._hs_pulsing = set()
         try:
             from daily_logger import get_last_hardware_state
@@ -840,7 +899,7 @@ class MyApp(QWidget):
             for _k in ("pot", "adr", "charcoal"):
                 _p = getattr(self.world.station.labjack, f"heatswitch_{_k}", None)
                 if _p and hasattr(_p, "cache"):
-                    _p.cache.set(self._hs_states.get(_k, "CLOSED"))
+                    _p.cache.set(self._hs_states.get(_k, "CLOSED" if _k != "charcoal" else "OPEN"))
 
         # Left-click drag & pan state
         self._drag_active = False
@@ -951,11 +1010,24 @@ class MyApp(QWidget):
         main_layout = QHBoxLayout()
         main_layout.setSpacing(4)
 
-        # ================= Control Sidebar (Compact Fixed 185px) =================
+        # ================= Control Sidebar (Compact Scrollable 225px) =================
         sidebar_frame = QFrame()
         sidebar_frame.setObjectName("sidebar_frame")
-        sidebar_frame.setFixedWidth(185)
-        sidebar_layout = QVBoxLayout(sidebar_frame)
+        sidebar_frame.setFixedWidth(225)
+        sidebar_outer_layout = QVBoxLayout(sidebar_frame)
+        sidebar_outer_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_outer_layout.setSpacing(0)
+
+        sidebar_scroll = QScrollArea()
+        sidebar_scroll.setObjectName("sidebar_scroll")
+        sidebar_scroll.setWidgetResizable(True)
+        sidebar_scroll.setFrameShape(QFrame.NoFrame)
+        sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        sidebar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        sidebar_content = QWidget()
+        sidebar_content.setObjectName("sidebar_content")
+        sidebar_layout = QVBoxLayout(sidebar_content)
         sidebar_layout.setAlignment(Qt.AlignTop)
         sidebar_layout.setContentsMargins(6, 6, 6, 6)
         sidebar_layout.setSpacing(5)
@@ -967,6 +1039,7 @@ class MyApp(QWidget):
 
         lbl_proc = QLabel("Procedure:")
         lbl_proc.setObjectName("muted_label")
+        sidebar_layout.addWidget(lbl_proc)
         sidebar_layout.addWidget(lbl_proc)
 
         self.combo_box = QComboBox(self)
@@ -986,9 +1059,12 @@ class MyApp(QWidget):
         self.btn_pause.clicked.connect(self.toggle_pause)
         self.btn_stop.clicked.connect(self.stop_state)
 
-        sidebar_layout.addWidget(self.btn_start)
-        sidebar_layout.addWidget(self.btn_pause)
-        sidebar_layout.addWidget(self.btn_stop)
+        btn_ctrl_row = QHBoxLayout()
+        btn_ctrl_row.setSpacing(3)
+        btn_ctrl_row.addWidget(self.btn_start)
+        btn_ctrl_row.addWidget(self.btn_pause)
+        btn_ctrl_row.addWidget(self.btn_stop)
+        sidebar_layout.addLayout(btn_ctrl_row)
 
         # --- Procedure Phase / Sub-Step Tracker ---
         self.phase_box = QFrame()
@@ -1013,7 +1089,6 @@ class MyApp(QWidget):
         self.phase_progress_bar.setTextVisible(False)
         self.phase_progress_bar.setRange(0, 100)
         self.phase_progress_bar.setValue(100)
-
         phase_layout.addWidget(self.lbl_phase_title)
         phase_layout.addWidget(self.lbl_phase_name)
         phase_layout.addWidget(self.lbl_phase_time)
@@ -1054,18 +1129,25 @@ class MyApp(QWidget):
         sep2.setObjectName("separator")
         sidebar_layout.addWidget(sep2)
 
+        live_row = QHBoxLayout()
+        live_row.setSpacing(3)
         self.lbl_data_source = QLabel("● Live")
         self.lbl_data_source.setAlignment(Qt.AlignCenter)
-        sidebar_layout.addWidget(self.lbl_data_source)
+        live_row.addWidget(self.lbl_data_source)
+        sidebar_layout.addLayout(live_row)
 
-        self.btn_live_data = QPushButton("Return to Live")
+        zoom_row = QHBoxLayout()
+        zoom_row.setSpacing(3)
+        self.btn_live_data = QPushButton("Live")
+        self.btn_live_data.setToolTip("Return to live real-time telemetry view")
         self.btn_live_data.setEnabled(False)
         self.btn_live_data.clicked.connect(self.return_to_live)
-        sidebar_layout.addWidget(self.btn_live_data)
+        zoom_row.addWidget(self.btn_live_data)
 
         self.btn_reset_zoom = QPushButton("Reset Zoom")
         self.btn_reset_zoom.clicked.connect(self.reset_zoom)
-        sidebar_layout.addWidget(self.btn_reset_zoom)
+        zoom_row.addWidget(self.btn_reset_zoom)
+        sidebar_layout.addLayout(zoom_row)
 
         # Separator above Heat Switches
         sep_hs = QFrame()
@@ -1080,6 +1162,7 @@ class MyApp(QWidget):
         hs_layout = QVBoxLayout(self.hs_box)
         hs_layout.setContentsMargins(0, 2, 0, 2)
         hs_layout.setSpacing(4)
+
 
         self.lbl_hs_title = QLabel("HEAT SWITCHES")
         self.lbl_hs_title.setFont(QFont("Segoe UI", 7, QFont.Bold))
@@ -1110,6 +1193,287 @@ class MyApp(QWidget):
 
         sidebar_layout.addWidget(self.hs_box)
 
+        self.sep_adr = QFrame()
+        self.sep_adr.setFrameShape(QFrame.HLine)
+        self.sep_adr.setFrameShadow(QFrame.Sunken)
+        self.sep_adr.setObjectName("separator")
+        sidebar_layout.addWidget(self.sep_adr)
+
+        # ================= ADR Parameters & Regulation Card (Bottom Left) =================
+        self.adr_params_box = QFrame()
+        self.adr_params_box.setObjectName("adr_params_box")
+        adr_card_layout = QVBoxLayout(self.adr_params_box)
+        adr_card_layout.setContentsMargins(5, 5, 5, 5)
+        adr_card_layout.setSpacing(4)
+
+        self.lbl_adr_card_title = QLabel("CYCLE & REGULATION PARAMETERS")
+        self.lbl_adr_card_title.setFont(QFont("Segoe UI", 7, QFont.Bold))
+        self.lbl_adr_card_title.setObjectName("muted_label")
+        adr_card_layout.addWidget(self.lbl_adr_card_title)
+
+        # Subsection 1: Heat Setpoints
+        lbl_sp_sec = QLabel("HEAT SETPOINTS")
+        lbl_sp_sec.setFont(QFont("Segoe UI", 7, QFont.Bold))
+        lbl_sp_sec.setObjectName("muted_label")
+        adr_card_layout.addWidget(lbl_sp_sec)
+
+        grid_sp = QGridLayout()
+        grid_sp.setSpacing(3)
+        grid_sp.setContentsMargins(0, 0, 0, 0)
+
+        tip_charcoal_sp = "Cryo-con loop 2 setpoint to heat sorption pump and desorb He-3 gas.\nDefault: 55.0 K."
+        lbl_charcoal_sp = QLabel("Charcoal (K):")
+        lbl_charcoal_sp.setFont(QFont("Segoe UI", 8))
+        lbl_charcoal_sp.setToolTip(tip_charcoal_sp)
+        self.spin_charcoal_sp = QDoubleSpinBox()
+        self.spin_charcoal_sp.setDecimals(1)
+        self.spin_charcoal_sp.setRange(1.0, 150.0)
+        self.spin_charcoal_sp.setSingleStep(1.0)
+        self.spin_charcoal_sp.setFixedWidth(64)
+        self.spin_charcoal_sp.setFixedHeight(22)
+        self.spin_charcoal_sp.setValue(float(self.gui_settings.get("adr_config", {}).get("charcoal_heat_sp", 55.0)))
+        self.spin_charcoal_sp.setToolTip(tip_charcoal_sp)
+        self.spin_charcoal_sp.valueChanged.connect(self._on_adr_param_changed)
+
+        tip_flange_sp = "Cryo-con loop 1 setpoint for 60K flange / stage desorption baking.\nDefault: 65.0 K."
+        lbl_flange_sp = QLabel("60K Flange (K):")
+        lbl_flange_sp.setFont(QFont("Segoe UI", 8))
+        lbl_flange_sp.setToolTip(tip_flange_sp)
+        self.spin_flange_sp = QDoubleSpinBox()
+        self.spin_flange_sp.setDecimals(1)
+        self.spin_flange_sp.setRange(1.0, 300.0)
+        self.spin_flange_sp.setSingleStep(1.0)
+        self.spin_flange_sp.setFixedWidth(64)
+        self.spin_flange_sp.setFixedHeight(22)
+        self.spin_flange_sp.setValue(float(self.gui_settings.get("adr_config", {}).get("flange_60k_heat_sp", 65.0)))
+        self.spin_flange_sp.setToolTip(tip_flange_sp)
+        self.spin_flange_sp.valueChanged.connect(self._on_adr_param_changed)
+
+        tip_pot_precool = "3K stage (Channel C) starting temperature threshold required before cycle begins.\nDefault: 3.2 K."
+        lbl_pot_precool = QLabel("3K Starting (K):")
+        lbl_pot_precool.setFont(QFont("Segoe UI", 8))
+        lbl_pot_precool.setToolTip(tip_pot_precool)
+        self.spin_pot_precool = QDoubleSpinBox()
+        self.spin_pot_precool.setDecimals(1)
+        self.spin_pot_precool.setRange(0.5, 10.0)
+        self.spin_pot_precool.setSingleStep(0.1)
+        self.spin_pot_precool.setFixedWidth(64)
+        self.spin_pot_precool.setFixedHeight(22)
+        val_3k = float(self.gui_settings.get("adr_config", {}).get("starting_temp_3k", self.gui_settings.get("adr_config", {}).get("pot_precool_limit_k", 3.2)))
+        self.spin_pot_precool.setValue(val_3k)
+        self.spin_pot_precool.setToolTip(tip_pot_precool)
+        self.spin_pot_precool.valueChanged.connect(self._on_adr_param_changed)
+        tip_launch_temp = "FAA stage launch temperature threshold required before opening ADR heat switch and ramping down magnet.\nDefault: 1.0 K."
+        lbl_launch_temp = QLabel("Launch Temp (K):")
+        lbl_launch_temp.setFont(QFont("Segoe UI", 8))
+        lbl_launch_temp.setToolTip(tip_launch_temp)
+        self.spin_launch_temp = QDoubleSpinBox()
+        self.spin_launch_temp.setDecimals(2)
+        self.spin_launch_temp.setRange(0.1, 10.0)
+        self.spin_launch_temp.setSingleStep(0.1)
+        self.spin_launch_temp.setFixedWidth(64)
+        self.spin_launch_temp.setFixedHeight(22)
+        val_launch = float(self.gui_settings.get("adr_config", {}).get("launch_temp_k", 1.0))
+        self.spin_launch_temp.setValue(val_launch)
+        self.spin_launch_temp.setToolTip(tip_launch_temp)
+        self.spin_launch_temp.valueChanged.connect(self._on_adr_param_changed)
+
+        grid_sp.addWidget(lbl_charcoal_sp, 0, 0)
+        grid_sp.addWidget(self.spin_charcoal_sp, 0, 1)
+        grid_sp.addWidget(lbl_flange_sp, 1, 0)
+        grid_sp.addWidget(self.spin_flange_sp, 1, 1)
+        grid_sp.addWidget(lbl_pot_precool, 2, 0)
+        grid_sp.addWidget(self.spin_pot_precool, 2, 1)
+        grid_sp.addWidget(lbl_launch_temp, 3, 0)
+        grid_sp.addWidget(self.spin_launch_temp, 3, 1)
+        adr_card_layout.addLayout(grid_sp)
+
+        # Subsection 2: Hold / Soak / Dwell Times
+        lbl_dwell_sec = QLabel("SOAK / DWELL TIMES")
+        lbl_dwell_sec.setFont(QFont("Segoe UI", 7, QFont.Bold))
+        lbl_dwell_sec.setObjectName("muted_label")
+        adr_card_layout.addWidget(lbl_dwell_sec)
+
+        grid_dwell = QGridLayout()
+        grid_dwell.setSpacing(3)
+        grid_dwell.setContentsMargins(0, 0, 0, 0)
+
+        tip_condense = "Duration to hold charcoal hot (55K) and magnet energized to condense He-3 liquid.\nDefault: 3.5 h."
+        lbl_condense = QLabel("Condense (h):")
+        lbl_condense.setFont(QFont("Segoe UI", 8))
+        lbl_condense.setToolTip(tip_condense)
+        self.spin_condense_dwell = QDoubleSpinBox()
+        self.spin_condense_dwell.setDecimals(1)
+        self.spin_condense_dwell.setRange(0.1, 24.0)
+        self.spin_condense_dwell.setSingleStep(0.5)
+        self.spin_condense_dwell.setFixedWidth(64)
+        self.spin_condense_dwell.setFixedHeight(22)
+        self.spin_condense_dwell.setValue(float(self.gui_settings.get("adr_config", {}).get("he3_condense_dwell_h", 3.5)))
+        self.spin_condense_dwell.setToolTip(tip_condense)
+        self.spin_condense_dwell.valueChanged.connect(self._on_adr_param_changed)
+
+        tip_launch_dwell = "Dwell / settle time (minutes) after opening ADR heat switch at launch temp before beginning magnet ramp down.\nAllows switch actuation friction heat to dissipate. Default: 10.0 min."
+        lbl_launch_dwell = QLabel("Launch Settle (min):")
+        lbl_launch_dwell.setFont(QFont("Segoe UI", 8))
+        lbl_launch_dwell.setToolTip(tip_launch_dwell)
+        self.spin_launch_dwell = QDoubleSpinBox()
+        self.spin_launch_dwell.setDecimals(1)
+        self.spin_launch_dwell.setRange(0.0, 120.0)
+        self.spin_launch_dwell.setSingleStep(1.0)
+        self.spin_launch_dwell.setFixedWidth(64)
+        self.spin_launch_dwell.setFixedHeight(22)
+        self.spin_launch_dwell.setValue(float(self.gui_settings.get("adr_config", {}).get("launch_dwell_min", 10.0)))
+        self.spin_launch_dwell.setToolTip(tip_launch_dwell)
+        self.spin_launch_dwell.valueChanged.connect(self._on_adr_param_changed)
+
+        grid_dwell.addWidget(lbl_condense, 0, 0)
+        grid_dwell.addWidget(self.spin_condense_dwell, 0, 1)
+        grid_dwell.addWidget(lbl_launch_dwell, 1, 0)
+        grid_dwell.addWidget(self.spin_launch_dwell, 1, 1)
+        adr_card_layout.addLayout(grid_dwell)
+
+        # Subsection 3: Magnet Ramp Speeds & Output
+        lbl_ramp_sec = QLabel("MAGNET RAMP SPEEDS")
+        lbl_ramp_sec.setFont(QFont("Segoe UI", 7, QFont.Bold))
+        lbl_ramp_sec.setObjectName("muted_label")
+        adr_card_layout.addWidget(lbl_ramp_sec)
+
+        grid_ramp = QGridLayout()
+        grid_ramp.setSpacing(3)
+        grid_ramp.setContentsMargins(0, 0, 0, 0)
+
+        tip_max_hout = "Peak magnet open-loop output % (~9.5 A).\nRamped up in Step 3 and held through the 3.5h condensation dwell. Default: 58.1%."
+        lbl_max_hout = QLabel("Max Output (%):")
+        lbl_max_hout.setFont(QFont("Segoe UI", 8))
+        lbl_max_hout.setToolTip(tip_max_hout)
+        self.spin_mag_max_hout = QDoubleSpinBox()
+        self.spin_mag_max_hout.setDecimals(1)
+        self.spin_mag_max_hout.setRange(0.0, 100.0)
+        self.spin_mag_max_hout.setSingleStep(0.5)
+        self.spin_mag_max_hout.setFixedWidth(64)
+        self.spin_mag_max_hout.setFixedHeight(22)
+        self.spin_mag_max_hout.setValue(float(self.gui_settings.get("adr_config", {}).get("magnet_max_hout", 58.1)))
+        self.spin_mag_max_hout.setToolTip(tip_max_hout)
+        self.spin_mag_max_hout.valueChanged.connect(self._on_adr_param_changed)
+
+        tip_ramp_up = "RAMPED UP: Step 3 (start of cycle, before 3.5h condensation dwell).\nRamps magnet 0% -> full field with ADR switch closed to dump heat. Default: 45.0 min."
+        lbl_ramp_up = QLabel("Ramp Up (min):")
+        lbl_ramp_up.setFont(QFont("Segoe UI", 8))
+        lbl_ramp_up.setToolTip(tip_ramp_up)
+        self.spin_mag_ramp_up = QDoubleSpinBox()
+        self.spin_mag_ramp_up.setDecimals(1)
+        self.spin_mag_ramp_up.setRange(1.0, 120.0)
+        self.spin_mag_ramp_up.setSingleStep(5.0)
+        self.spin_mag_ramp_up.setFixedWidth(64)
+        self.spin_mag_ramp_up.setFixedHeight(22)
+        self.spin_mag_ramp_up.setValue(float(self.gui_settings.get("adr_config", {}).get("magnet_ramp_up_min", 45.0)))
+        self.spin_mag_ramp_up.setToolTip(tip_ramp_up)
+        self.spin_mag_ramp_up.valueChanged.connect(self._on_adr_param_changed)
+
+        tip_ramp_down = "RAMPED DOWN (DEMAG): Step 6 (end of cycle, after charcoal cooling).\nOpens ADR switch and ramps magnet to 0% to cool FAA stage to base (<100 mK). Default: 45.0 min."
+        lbl_ramp_down = QLabel("Ramp Down (min):")
+        lbl_ramp_down.setFont(QFont("Segoe UI", 8))
+        lbl_ramp_down.setToolTip(tip_ramp_down)
+        self.spin_mag_ramp_down = QDoubleSpinBox()
+        self.spin_mag_ramp_down.setDecimals(1)
+        self.spin_mag_ramp_down.setRange(1.0, 120.0)
+        self.spin_mag_ramp_down.setSingleStep(5.0)
+        self.spin_mag_ramp_down.setFixedWidth(64)
+        self.spin_mag_ramp_down.setFixedHeight(22)
+        self.spin_mag_ramp_down.setValue(float(self.gui_settings.get("adr_config", {}).get("magnet_ramp_down_min", 60.0)))
+        self.spin_mag_ramp_down.setToolTip(tip_ramp_down)
+        self.spin_mag_ramp_down.valueChanged.connect(self._on_adr_param_changed)
+
+        tip_settle = "Post-demag hold time (after magnet reaches 0%) before switching to closed PID regulation.\nDefault: 20.0 min."
+        lbl_settle = QLabel("Demag Settle (min):")
+        lbl_settle.setFont(QFont("Segoe UI", 8))
+        lbl_settle.setToolTip(tip_settle)
+        self.spin_demag_settle = QDoubleSpinBox()
+        self.spin_demag_settle.setDecimals(1)
+        self.spin_demag_settle.setRange(0.0, 120.0)
+        self.spin_demag_settle.setSingleStep(5.0)
+        self.spin_demag_settle.setFixedWidth(64)
+        self.spin_demag_settle.setFixedHeight(22)
+        self.spin_demag_settle.setValue(float(self.gui_settings.get("adr_config", {}).get("demag_settle_min", 20.0)))
+        self.spin_demag_settle.setToolTip(tip_settle)
+        self.spin_demag_settle.valueChanged.connect(self._on_adr_param_changed)
+
+        grid_ramp.addWidget(lbl_max_hout, 0, 0)
+        grid_ramp.addWidget(self.spin_mag_max_hout, 0, 1)
+        grid_ramp.addWidget(lbl_ramp_up, 1, 0)
+        grid_ramp.addWidget(self.spin_mag_ramp_up, 1, 1)
+        grid_ramp.addWidget(lbl_ramp_down, 2, 0)
+        grid_ramp.addWidget(self.spin_mag_ramp_down, 2, 1)
+        grid_ramp.addWidget(lbl_settle, 3, 0)
+        grid_ramp.addWidget(self.spin_demag_settle, 3, 1)
+        adr_card_layout.addLayout(grid_ramp)
+
+        # Subsection 4: Temperature Regulation (Placed at the bottom)
+        lbl_reg_sec = QLabel("TEMPERATURE REGULATION")
+        lbl_reg_sec.setFont(QFont("Segoe UI", 7, QFont.Bold))
+        lbl_reg_sec.setObjectName("muted_label")
+        adr_card_layout.addWidget(lbl_reg_sec)
+
+        grid_reg = QGridLayout()
+        grid_reg.setSpacing(3)
+        grid_reg.setContentsMargins(0, 0, 0, 0)
+
+        tip_reg = "Target temperature for closed-loop Lake Shore 370 PID regulation (relay set to CONTROL).\nDefault: 50.0 mK."
+        lbl_reg = QLabel("Regulate (mK):")
+        lbl_reg.setFont(QFont("Segoe UI", 8))
+        lbl_reg.setToolTip(tip_reg)
+        self.spin_reg_temp = QDoubleSpinBox()
+        self.spin_reg_temp.setDecimals(1)
+        self.spin_reg_temp.setRange(1.0, 300000.0)
+        self.spin_reg_temp.setSingleStep(5.0)
+        self.spin_reg_temp.setFixedWidth(64)
+        self.spin_reg_temp.setFixedHeight(22)
+        adr_cfg = self.gui_settings.get("adr_config", {})
+        if "regulate_temp_mk" in adr_cfg:
+            init_mk = float(adr_cfg["regulate_temp_mk"])
+        elif "regulate_temp_k" in adr_cfg:
+            k_val = float(adr_cfg["regulate_temp_k"])
+            init_mk = k_val if k_val >= 1.0 else k_val * 1000.0
+        else:
+            init_mk = 50.0
+        self.spin_reg_temp.setValue(init_mk)
+        self.spin_reg_temp.setToolTip(tip_reg)
+        self.spin_reg_temp.valueChanged.connect(self._on_adr_param_changed)
+
+        grid_reg.addWidget(lbl_reg, 0, 0)
+        grid_reg.addWidget(self.spin_reg_temp, 0, 1)
+        adr_card_layout.addLayout(grid_reg)
+
+        # Action Buttons Row: [Update] and [Reset Recipe Defaults]
+        btn_action_row = QHBoxLayout()
+        btn_action_row.setSpacing(4)
+
+        self.btn_update_params = QPushButton("Update")
+        self.btn_update_params.setObjectName("btn_update_params")
+        self.btn_update_params.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        self.btn_update_params.setCursor(Qt.PointingHandCursor)
+        self.btn_update_params.setToolTip("Hot-update active hardware setpoints (LS370 / Cryo-con) and save all parameter changes.")
+        self.btn_update_params.clicked.connect(self.hot_update_params)
+        btn_action_row.addWidget(self.btn_update_params, stretch=1)
+
+        self.btn_reset_adr_params = QPushButton("Reset Defaults")
+        self.btn_reset_adr_params.setObjectName("btn_reset_adr_params")
+        self.btn_reset_adr_params.setFont(QFont("Segoe UI", 8))
+        self.btn_reset_adr_params.setToolTip("Reset all setpoints, soak times, ramp durations, and regulation to factory recipe defaults.")
+        self.btn_reset_adr_params.clicked.connect(self.reset_default_adr_params)
+        btn_action_row.addWidget(self.btn_reset_adr_params, stretch=1)
+
+        adr_card_layout.addLayout(btn_action_row)
+
+        sidebar_layout.addWidget(self.adr_params_box)
+
+        # Set initial visibility of expert section based on current mode
+        self.adr_params_box.setVisible(self.expert_mode)
+        self.sep_adr.setVisible(self.expert_mode)
+
+        sidebar_scroll.setWidget(sidebar_content)
+        sidebar_outer_layout.addWidget(sidebar_scroll)
+
         main_layout.addWidget(sidebar_frame)
 
         # ================= Four Primary Navigation Tabs =================
@@ -1121,21 +1485,23 @@ class MyApp(QWidget):
         graphs_layout.setContentsMargins(1, 1, 1, 1)
         graphs_layout.setSpacing(2)
 
-        # Sleek plot toolbar with View selector, Time Range, Scale, Theme, and Matplotlib actions
+        # Sleek plot toolbar with View tabs, Time Range, Scale, Theme, and Plot controls
         plot_ctrl_bar = QHBoxLayout()
-        plot_ctrl_bar.setContentsMargins(2, 0, 2, 0)
-        plot_ctrl_bar.setSpacing(4)
+        plot_ctrl_bar.setContentsMargins(2, 2, 2, 2)
+        plot_ctrl_bar.setSpacing(6)
 
-        lbl_v = QLabel("View:")
-        lbl_v.setObjectName("muted_label")
-        plot_ctrl_bar.addWidget(lbl_v)
-
-        self.combo_view = QComboBox()
-        self.combo_view.wheelEvent = lambda event: None
-        self.combo_view.addItems(["Overview", "Thermometers", "Pressure", "Diagnostics"])
-        self.combo_view.setCurrentText("Overview")
-        self.combo_view.currentTextChanged.connect(self.on_view_changed)
-        plot_ctrl_bar.addWidget(self.combo_view)
+        self.plot_view_tabs = QTabBar()
+        self.plot_view_tabs.setObjectName("plot_view_tabs")
+        self.plot_view_tabs.setDrawBase(False)
+        self.plot_view_tabs.setExpanding(False)
+        self.plot_view_tabs.setCursor(Qt.PointingHandCursor)
+        self.plot_view_tabs.addTab("Overview")
+        self.plot_view_tabs.addTab("Thermometers")
+        self.plot_view_tabs.addTab("Pressures")
+        self.plot_view_tabs.addTab("Diagnostics")
+        self.plot_view_tabs.setCurrentIndex(0)
+        self.plot_view_tabs.currentChanged.connect(self._on_plot_tab_index_changed)
+        plot_ctrl_bar.addWidget(self.plot_view_tabs)
 
         plot_ctrl_bar.addSpacing(6)
         lbl_tw = QLabel("Range:")
@@ -1150,18 +1516,23 @@ class MyApp(QWidget):
         self.combo_time_window.activated.connect(lambda idx: self.on_time_window_changed(self.combo_time_window.itemText(idx)))
         plot_ctrl_bar.addWidget(self.combo_time_window)
 
-        plot_ctrl_bar.addSpacing(6)
+        plot_ctrl_bar.addSpacing(2)
         self.btn_toggle_temp_scale = QPushButton("Log Scale")
         self.btn_toggle_temp_scale.clicked.connect(self.toggle_temp_scale)
         plot_ctrl_bar.addWidget(self.btn_toggle_temp_scale)
 
-        self.btn_subkelvin_filter = QPushButton("🔍 Sub-Kelvin")
+        self.btn_subkelvin_filter = QPushButton("Sub-Kelvin")
         self.btn_subkelvin_filter.setCheckable(True)
         self.btn_subkelvin_filter.setToolTip("Toggle to isolate sub-Kelvin stages (Pot & FAA) and rescale Y-axis")
         self.btn_subkelvin_filter.clicked.connect(self.toggle_subkelvin_filter)
         plot_ctrl_bar.addWidget(self.btn_subkelvin_filter)
 
-        self.btn_snapshot = QPushButton("📷 Snapshot")
+        self.btn_plot_reset_zoom = QPushButton("Reset Zoom")
+        self.btn_plot_reset_zoom.setToolTip("Reset pan & zoom to default time window (or right-click anywhere on the plot)")
+        self.btn_plot_reset_zoom.clicked.connect(self.reset_zoom)
+        plot_ctrl_bar.addWidget(self.btn_plot_reset_zoom)
+
+        self.btn_snapshot = QPushButton("Snapshot")
         self.btn_snapshot.setToolTip("Export 8-panel cooldown snapshot to ~/2pac_logs/snapshots/")
         self.btn_snapshot.clicked.connect(self.export_plot_snapshot)
         plot_ctrl_bar.addWidget(self.btn_snapshot)
@@ -1174,12 +1545,6 @@ class MyApp(QWidget):
 
         self.figure = plt.Figure(figsize=(10, 8))
         self.canvas = FigureCanvas(self.figure)
-        self.toolbar = NavigationToolbar2QT(self.canvas, self)
-        for action in self.toolbar.actions():
-            if action.text() in ("Subplots", "Customize"):
-                self.toolbar.removeAction(action)
-
-        plot_ctrl_bar.addWidget(self.toolbar)
         graphs_layout.addLayout(plot_ctrl_bar)
         graphs_layout.addWidget(self.canvas)
 
@@ -1209,16 +1574,6 @@ class MyApp(QWidget):
 
         self.text_output = QTextEdit(self)
         self.text_output.setReadOnly(False)
-        self.text_output.setLineWrapMode(QTextEdit.NoWrap)
-        scripting_layout.addWidget(self.text_output)
-        self.scripting_tab.setLayout(scripting_layout)
-
-        # --- 3. Channels Tab (The 3rd Tab as required) ---
-        self.settings_tab = QWidget()
-        settings_layout = QVBoxLayout()
-        settings_layout.setContentsMargins(12, 10, 12, 10)
-        settings_layout.setSpacing(8)
-
         settings_top = QHBoxLayout()
         lbl_settings_hdr = QLabel("Channel Aliases")
         lbl_settings_hdr.setObjectName("section_header")
@@ -1264,6 +1619,16 @@ class MyApp(QWidget):
             row_idx += 1
 
         self.alias_grid.setRowStretch(row_idx, 1)
+        scroll_area.setWidget(scroll_content)
+        settings_layout.addWidget(scroll_area)
+        self.settings_tab.setLayout(settings_layout)
+
+        # --- 4. History Tab (Database Explorer) ---
+        self.db_tab = QWidget()
+        db_layout = QVBoxLayout()
+        db_layout.setContentsMargins(8, 8, 8, 8)
+        db_layout.setSpacing(6)
+
         scroll_area.setWidget(scroll_content)
         settings_layout.addWidget(scroll_area)
         self.settings_tab.setLayout(settings_layout)
@@ -1343,7 +1708,7 @@ class MyApp(QWidget):
 
         self.setLayout(outer_layout)
 
-        # Apply initial theme (Light Mode default)
+        # Apply initial theme 
         self.apply_theme()
 
         # Initial DB population
@@ -1357,18 +1722,7 @@ class MyApp(QWidget):
             self.show_operator_banner(f"ℹ Magnet energized at {prev_i:.3f} A. Hardware settings held safely from previous session.")
 
         # Thread setup with completion, error, and operator alert hooks
-        active_proc = last_hw.get("active_procedure", "") if last_hw else ""
         first_st = wait_forever
-        if active_proc == "ready_for_cooldown" and "ready_for_cooldown" in states_dict:
-            first_st = states_dict["ready_for_cooldown"]
-            idx = self.combo_box.findData("ready_for_cooldown")
-            if idx >= 0:
-                self.combo_box.blockSignals(True)
-                self.combo_box.setCurrentIndex(idx)
-                self.combo_box.blockSignals(False)
-            self._set_status_badge("RUNNING", "running")
-            self.lbl_script_name.setText(f"Active Script: {state_label('ready_for_cooldown')}")
-
         self.data_thread = DataFetchThread(world, first_state=first_st, states_dict=states_dict)
         self.data_thread.state_update.connect(self.state_update)
         self.data_thread.procedure_finished.connect(self._on_procedure_finished)
@@ -1388,6 +1742,11 @@ class MyApp(QWidget):
         self.plot_timer.setInterval(cadence_s * 1000)
         self.plot_timer.timeout.connect(self._on_plot_timer)
         self.plot_timer.start()
+
+        # Debounced zoom/pan line updater (for instantaneous responsiveness on scroll/drag)
+        self._zoom_update_timer = QTimer(self)
+        self._zoom_update_timer.setSingleShot(True)
+        self._zoom_update_timer.timeout.connect(self.update_plot)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1451,16 +1810,18 @@ class MyApp(QWidget):
 
         # 4. Save window geometry
         if not self.isMaximized() and not self.isMinimized():
-            self.gui_settings["window_width"] = self.width()
-            self.gui_settings["window_height"] = self.height()
+            self.gui_settings["window_geometry"] = {
+                "x": self.pos().x(),
+                "y": self.pos().y(),
+                "width": self.size().width(),
+                "height": self.size().height(),
+            }
             save_gui_settings(self.gui_settings)
+        event.accept()
 
-        super().closeEvent(event)
-
-    # ------------- Theming & Visual Styling ---------------
     def _set_status_badge(self, text, state_key):
-        self.current_badge_state = state_key
         self.lbl_status_badge.setText(text)
+        self.current_badge_state = state_key
         style = STATUS_BADGE_STYLES.get(self.theme, {}).get(state_key, "")
         self.lbl_status_badge.setStyleSheet(style)
 
@@ -1492,12 +1853,6 @@ class MyApp(QWidget):
         is_light = (self.theme == "light")
         self.setStyleSheet(LIGHT_QSS if is_light else DARK_QSS)
 
-        # Matplotlib navigation toolbar
-        if is_light:
-            self.toolbar.setStyleSheet("background-color: #ffffff; color: #0f172a; border: 1px solid #cbd5e1; border-radius: 4px; padding: 1px;")
-        else:
-            self.toolbar.setStyleSheet("background-color: #1e293b; color: #f8fafc; border: 1px solid #334155; border-radius: 4px; padding: 1px;")
-
         self._style_temp_scale_btn()
 
         if is_light:
@@ -1510,6 +1865,13 @@ class MyApp(QWidget):
             self.lbl_phase_title.setStyleSheet("color: #64748b;")
             self.lbl_phase_name.setStyleSheet("color: #0f172a;")
             self.btn_snapshot.setStyleSheet("background-color: #ffffff; color: #475569; border: 1px solid #cbd5e1; font-weight: 500; padding: 4px 10px; border-radius: 4px;")
+            if hasattr(self, "adr_params_box"):
+                self.adr_params_box.setStyleSheet("QFrame#adr_params_box { background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; }")
+            if hasattr(self, "btn_update_params"):
+                self.btn_update_params.setStyleSheet(
+                    "QPushButton#btn_update_params { background-color: #0284c7; color: #ffffff; border: 1px solid #0369a1; font-weight: 700; border-radius: 4px; padding: 4px 8px; }"
+                    "QPushButton#btn_update_params:hover { background-color: #0369a1; }"
+                )
         else:
             self.btn_theme_toggle.setText("Light")
             self.btn_theme_toggle.setStyleSheet("background-color: #1e293b; color: #f8fafc; border: 1px solid #334155; font-weight: 500; padding: 4px 10px; border-radius: 4px;")
@@ -1520,6 +1882,13 @@ class MyApp(QWidget):
             self.lbl_phase_title.setStyleSheet("color: #94a3b8;")
             self.lbl_phase_name.setStyleSheet("color: #f8fafc;")
             self.btn_snapshot.setStyleSheet("background-color: #1e293b; color: #cbd5e1; border: 1px solid #334155; font-weight: 500; padding: 4px 10px; border-radius: 4px;")
+            if hasattr(self, "adr_params_box"):
+                self.adr_params_box.setStyleSheet("QFrame#adr_params_box { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 6px; }")
+            if hasattr(self, "btn_update_params"):
+                self.btn_update_params.setStyleSheet(
+                    "QPushButton#btn_update_params { background-color: #0284c7; color: #ffffff; border: 1px solid #38bdf8; font-weight: 700; border-radius: 4px; padding: 4px 8px; }"
+                    "QPushButton#btn_update_params:hover { background-color: #0ea5e9; }"
+                )
 
         # Digital metric tiles styling — filled solid with plot line colors and white text
         for key, spec in self.metric_tiles.items():
@@ -1540,6 +1909,19 @@ class MyApp(QWidget):
 
         thm = THEMES.get(self.theme, THEMES["light"])
         self.figure.set_facecolor(thm["fig_bg"])
+        plt.rcParams['xtick.color'] = thm["tick_color"]
+        plt.rcParams['ytick.color'] = thm["tick_color"]
+        plt.rcParams['text.color'] = thm["text"]
+        plt.rcParams['axes.labelcolor'] = thm["text"]
+        plt.rcParams['axes.edgecolor'] = thm["spine"]
+
+        for ax in self.figure.axes:
+            ax.set_facecolor(thm["ax_bg"])
+            for spine in ax.spines.values():
+                spine.set_color(thm["spine"])
+            ax.tick_params(axis="both", which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"])
+            ax.yaxis.set_tick_params(which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"])
+            ax.xaxis.set_tick_params(which="both", colors=thm["tick_color"], labelcolor=thm["tick_color"])
 
         self.update_plot()
 
@@ -1624,6 +2006,16 @@ class MyApp(QWidget):
         self.apply_theme()
 
     # ------------- Database / Daily Logs Explorer Methods ---------------
+
+    def confirm_operator_action(self):
+        QApplication.beep()
+        self.dismiss_operator_banner()
+
+    def toggle_theme(self):
+        self.theme = "dark" if self.theme == "light" else "light"
+        self.apply_theme()
+
+    # ------------- Database / Daily Logs Explorer Methods ---------------
     def choose_db_file(self):
         options = QFileDialog.Options()
         file_name, _ = QFileDialog.getOpenFileName(self, "Select Log Database or Directory", str(Path.home() / "2pac_logs"), "Database Files (*.db);;All Files (*)", options=options)
@@ -1695,16 +2087,6 @@ class MyApp(QWidget):
             CHANNEL_ALIASES[key] = inp.text().strip() or key
         save_aliases()
         self.update_plot()
-        QMessageBox.information(self, "Saved", "Channel aliases updated.")
-
-    def reset_default_aliases(self):
-        CHANNEL_ALIASES.update(DEFAULT_CHANNEL_ALIASES)
-        for key, inp in self.alias_inputs.items():
-            if key in DEFAULT_CHANNEL_ALIASES:
-                inp.setText(DEFAULT_CHANNEL_ALIASES[key])
-        save_aliases()
-        self.update_plot()
-
     def _populate_state_combo(self):
         cur_key = self.current_selected_state_key() or IDLE_STATE
         self.combo_box.blockSignals(True)
@@ -1798,10 +2180,25 @@ class MyApp(QWidget):
         if hasattr(self, "chk_expert_mode") and self.chk_expert_mode.isChecked() != self.expert_mode:
             self.chk_expert_mode.blockSignals(True)
             self.chk_expert_mode.setChecked(self.expert_mode)
+            self.expert_mode = bool(enabled)
+
+        print(f"[MODE] Mode switched to: {'Expert' if self.expert_mode else 'Simple'}")
+        self.gui_settings["expert_mode"] = self.expert_mode
+        save_gui_settings(self.gui_settings)
+
+        self._style_mode_btn()
+        if hasattr(self, "chk_expert_mode") and self.chk_expert_mode.isChecked() != self.expert_mode:
+            self.chk_expert_mode.blockSignals(True)
+            self.chk_expert_mode.setChecked(self.expert_mode)
             self.chk_expert_mode.blockSignals(False)
 
         if hasattr(self, "btn_reload_scripts"):
             self.btn_reload_scripts.setVisible(self.expert_mode)
+
+        if hasattr(self, "adr_params_box"):
+            self.adr_params_box.setVisible(self.expert_mode)
+        if hasattr(self, "sep_adr"):
+            self.sep_adr.setVisible(self.expert_mode)
 
         if self.expert_mode:
             if hasattr(self, "scripting_tab") and self.main_tabs.indexOf(self.scripting_tab) == -1:
@@ -1832,16 +2229,6 @@ class MyApp(QWidget):
 
     def _on_procedure_finished(self, state_name):
         self._set_status_badge("IDLE", "idle")
-        idx = self.combo_box.findData(IDLE_STATE)
-        if idx >= 0:
-            self.combo_box.blockSignals(True)
-            self.combo_box.setCurrentIndex(idx)
-            self.combo_box.blockSignals(False)
-        self.lbl_script_name.setText(f"Active Script: {state_label(IDLE_STATE)}")
-        self.show_operator_banner(f"✓ Procedure '{state_label(state_name)}' completed. Returned to Idle.")
-
-    def _on_procedure_error(self, state_name, err_msg):
-        self._set_status_badge("ERROR", "error")
         idx = self.combo_box.findData(IDLE_STATE)
         if idx >= 0:
             self.combo_box.blockSignals(True)
@@ -2319,7 +2706,7 @@ Categories=Science;Utility;
             if hasattr(self.world, "station") and hasattr(self.world.station, "labjack"):
                 param = getattr(self.world.station.labjack, param_name, None)
                 if param:
-                    val = str(param())
+                    val = str(param.cache.get() if hasattr(param, "cache") else (param.raw_value if hasattr(param, "raw_value") else ""))
                     if val in ("OPEN", "CLOSED") and val != self._hs_states.get(key):
                         self._hs_states[key] = val
                         changed = True
@@ -2351,6 +2738,7 @@ Categories=Science;Utility;
                         idx = self.combo_box.findData(found_key)
                         if idx >= 0:
                             self.combo_box.setCurrentIndex(idx)
+                            self.on_combo_changed(idx)
                         self.request_state_change(bypass_confirm=True)
                 elif cmd.startswith("select_state:"):
                     name = cmd.split("select_state:")[1].strip()
@@ -2377,10 +2765,11 @@ Categories=Science;Utility;
                         self.toggle_expert_mode(True)
                 elif cmd.startswith("view:"):
                     v_name = cmd.split("view:")[1].strip()
-                    for i in range(self.combo_view.count()):
-                        if v_name.lower() in self.combo_view.itemText(i).lower():
-                            self.combo_view.setCurrentIndex(i)
-                            break
+                    if hasattr(self, 'plot_view_tabs'):
+                        for i in range(self.plot_view_tabs.count()):
+                            if v_name.lower() in self.plot_view_tabs.tabText(i).lower():
+                                self.plot_view_tabs.setCurrentIndex(i)
+                                break
                 elif cmd.startswith("range:"):
                     r_name = cmd.split("range:")[1].strip()
                     for i in range(self.combo_time_window.count()):
@@ -2422,8 +2811,205 @@ Categories=Science;Utility;
                         val = parts[1].strip().upper()
                         if val in ("OPEN", "CLOSED"):
                             self.set_heatswitch_state(hs_key, val)
+                elif cmd.startswith("regulate:"):
+                    temp_str = cmd.split("regulate:")[1].strip()
+                    try:
+                        self.spin_reg_temp.setValue(float(temp_str))
+                        self.hot_update_params(bypass_popup=True)
+                    except Exception as e:
+                        print(f"Error executing external regulate command: {e}")
+                elif cmd in ("update", "update_params", "hot_update", "regulate"):
+                    self.hot_update_params(bypass_popup=True)
+                elif cmd == "reset_adr_params":
+                    self.reset_default_adr_params()
+                elif cmd.startswith("set_adr_param:"):
+                    parts = cmd.split("set_adr_param:")[1].strip().split(":")
+                    if len(parts) == 2:
+                        pk, pv = parts[0].strip(), float(parts[1].strip())
+                        spin_map = {
+                            "charcoal_heat_sp": getattr(self, "spin_charcoal_sp", None),
+                            "flange_60k_heat_sp": getattr(self, "spin_flange_sp", None),
+                            "starting_temp_3k": getattr(self, "spin_starting_temp_3k", getattr(self, "spin_pot_precool", None)),
+                            "pot_precool_limit_k": getattr(self, "spin_starting_temp_3k", getattr(self, "spin_pot_precool", None)),
+                            "launch_temp_k": getattr(self, "spin_launch_temp", None),
+                            "launch_dwell_min": getattr(self, "spin_launch_dwell", None),
+                            "he3_condense_dwell_h": getattr(self, "spin_condense_dwell", None),
+                            "magnet_max_hout": getattr(self, "spin_mag_max_hout", None),
+                            "magnet_ramp_up_min": getattr(self, "spin_mag_ramp_up", None),
+                            "magnet_ramp_down_min": getattr(self, "spin_mag_ramp_down", None),
+                            "demag_settle_min": getattr(self, "spin_demag_settle", None),
+                            "regulate_temp_k": getattr(self, "spin_reg_temp", None),
+                        }
+                        sp = spin_map.get(pk)
+                        if sp is not None:
+                            sp.setValue(pv)
+                elif cmd in ("resync_ls370", "flush_ls370"):
+                    try:
+                        if hasattr(self, "world") and hasattr(self.world, "station") and self.world.station:
+                            st = self.world.station
+                            if hasattr(st, "ls370") and hasattr(st.ls370, "visa_handle"):
+                                vh = st.ls370.visa_handle
+                                if hasattr(vh, "flush"):
+                                    import pyvisa.constants as pv_const
+                                    vh.flush(pv_const.VI_READ_BUF_DISCARD)
+                                elif hasattr(vh, "read_raw"):
+                                    vh.read_raw()
+                                print("[EXTERNAL CMD] Flushed LS370 VISA read buffer.")
+                    except Exception as fe:
+                        print(f"Error flushing LS370: {fe}")
+                elif cmd.startswith("scroll_sidebar:"):
+                    s_val = cmd.split("scroll_sidebar:")[1].strip()
+                    if hasattr(self, "sidebar_scroll") and self.sidebar_scroll:
+                        vsb = self.sidebar_scroll.verticalScrollBar()
+                        if s_val == "bottom":
+                            vsb.setValue(vsb.maximum())
+                        elif s_val == "top":
+                            vsb.setValue(0)
+                        else:
+                            try:
+                                vsb.setValue(int(s_val))
+                            except Exception:
+                                pass
+                elif cmd.startswith("screenshot:"):
+                    shot_path = cmd.split("screenshot:")[1].strip()
+                    try:
+                        self.grab().save(shot_path)
+                        print(f"Direct widget screenshot saved to {shot_path}")
+                    except Exception as se:
+                        print(f"Error saving screenshot: {se}")
         except Exception as e:
             print(f"Error handling external command: {e}")
+
+    # ------------- ADR Cycle Parameters & Temperature Regulation Methods ---------------
+    def _on_adr_param_changed(self):
+        """Called whenever any ADR recipe or regulation parameter spinbox is edited."""
+        self._sync_adr_config_to_world()
+        if hasattr(self, "world") and hasattr(self.world, "adr_config"):
+            self.gui_settings["adr_config"] = dict(self.world.adr_config)
+            save_gui_settings(self.gui_settings)
+
+    def _sync_adr_config_to_world(self):
+        """Synchronize UI spinbox values into world.adr_config."""
+        if not hasattr(self, "spin_charcoal_sp"):
+            return
+        val_3k = float(self.spin_starting_temp_3k.value()) if hasattr(self, "spin_starting_temp_3k") else float(self.spin_pot_precool.value())
+        val_launch = float(self.spin_launch_temp.value()) if hasattr(self, "spin_launch_temp") else 1.0
+        val_launch_dwell = float(self.spin_launch_dwell.value()) if hasattr(self, "spin_launch_dwell") else 10.0
+        cfg = {
+            "charcoal_heat_sp": float(self.spin_charcoal_sp.value()),
+            "flange_60k_heat_sp": float(self.spin_flange_sp.value()),
+            "starting_temp_3k": val_3k,
+            "pot_precool_limit_k": val_3k,
+            "launch_temp_k": val_launch,
+            "launch_dwell_min": val_launch_dwell,
+            "he3_condense_dwell_h": float(self.spin_condense_dwell.value()),
+            "magnet_max_hout": float(self.spin_mag_max_hout.value()),
+            "magnet_ramp_up_min": float(self.spin_mag_ramp_up.value()),
+            "magnet_ramp_down_min": float(self.spin_mag_ramp_down.value()),
+            "demag_settle_min": float(self.spin_demag_settle.value()),
+            "regulate_temp_mk": float(self.spin_reg_temp.value()),
+            "regulate_temp_k": float(self.spin_reg_temp.value()) / 1000.0,
+        }
+        if hasattr(self, "world"):
+            self.world.adr_config = cfg
+
+    def reset_default_adr_params(self):
+        """Restore all ADR cycle parameters to default recipe values."""
+        import states
+        defaults = states.DEFAULT_ADR_CONFIG
+        val_3k_def = defaults.get("starting_temp_3k", defaults.get("pot_precool_limit_k", 3.2))
+        def_reg_mk = defaults.get("regulate_temp_mk", defaults.get("regulate_temp_k", 0.050) * 1000.0)
+        if def_reg_mk < 1.0:
+            def_reg_mk *= 1000.0
+        spins = [
+            (self.spin_charcoal_sp, defaults["charcoal_heat_sp"]),
+            (self.spin_flange_sp, defaults["flange_60k_heat_sp"]),
+            (getattr(self, "spin_starting_temp_3k", self.spin_pot_precool), val_3k_def),
+            (getattr(self, "spin_launch_temp", None), defaults.get("launch_temp_k", 1.0)),
+            (getattr(self, "spin_launch_dwell", None), defaults.get("launch_dwell_min", 10.0)),
+            (self.spin_condense_dwell, defaults["he3_condense_dwell_h"]),
+            (self.spin_mag_max_hout, defaults["magnet_max_hout"]),
+            (self.spin_mag_ramp_up, defaults["magnet_ramp_up_min"]),
+            (self.spin_mag_ramp_down, defaults["magnet_ramp_down_min"]),
+            (self.spin_demag_settle, defaults["demag_settle_min"]),
+            (self.spin_reg_temp, def_reg_mk),
+        ]
+        for sp, val in spins:
+            if sp is not None:
+                sp.blockSignals(True)
+                sp.setValue(val)
+                sp.blockSignals(False)
+        self._on_adr_param_changed()
+        QMessageBox.information(self, "Defaults Restored", "ADR cycle recipe parameters restored to factory defaults.")
+
+    def hot_update_params(self, bypass_popup=False):
+        """
+        Hot-updates active hardware setpoints and saves all parameter changes immediately.
+        - Updates world.adr_config and saves to gui_settings.json.
+        - If Lake Shore 370 is actively running regulate_temperature, updates LS370 setpoint live via write command (no queries).
+        - If Cryo-con loops are active, updates loop setpoints live.
+        """
+        self._sync_adr_config_to_world()
+        if hasattr(self, "world") and hasattr(self.world, "adr_config"):
+            self.gui_settings["adr_config"] = dict(self.world.adr_config)
+            save_gui_settings(self.gui_settings)
+
+        target_mk = float(self.spin_reg_temp.value())
+        target_k = target_mk / 1000.0 if target_mk >= 1.0 else target_mk
+        disp_target = f"{target_mk:.1f} mK" if target_mk < 1000.0 else f"{target_k:.3f} K"
+
+        def _apply_live_updates():
+            try:
+                if hasattr(self, "world") and hasattr(self.world, "station") and self.world.station:
+                    st = self.world.station
+                    # 1. Hot update LS370 heater setpoint ONLY if actively in regulate_temperature state
+                    # Note: We do NOT query rc.mode() over serial to avoid serial port collisions with telemetry update()
+                    if hasattr(st, "ls370") and st.ls370:
+                        rc = st.ls370.heater
+                        try:
+                            if self.data_thread and self.data_thread.state and self.data_thread.state.name() == "regulate_temperature":
+                                rc.setpoint(target_k)
+                                print(f"[HOT UPDATE] LS370 closed-loop setpoint hot-updated to {target_k:.4f} K ({disp_target})")
+                        except Exception as e:
+                            print(f"[HOT UPDATE] LS370 setpoint update error: {e}")
+
+                    # 2. Hot update Cryo-con loops if loop control is active
+                    if hasattr(st, "cryocon") and st.cryocon:
+                        try:
+                            flange_sp = float(self.spin_flange_sp.value())
+                            charcoal_sp = float(self.spin_charcoal_sp.value())
+                            st.cryocon.loop1_setpoint(flange_sp)
+                            st.cryocon.loop2_setpoint(charcoal_sp)
+                            print(f"[HOT UPDATE] Cryo-con loop setpoints updated: Flange={flange_sp:.1f} K, Charcoal={charcoal_sp:.1f} K")
+                        except Exception as e:
+                            print(f"[HOT UPDATE] Cryo-con update error: {e}")
+            except Exception as e:
+                print(f"[HOT UPDATE] Error applying live updates: {e}")
+
+        threading.Thread(target=_apply_live_updates, daemon=True).start()
+
+        # Visual feedback on button
+        if hasattr(self, "btn_update_params"):
+            self.btn_update_params.setText("✓ Updated")
+            self.btn_update_params.setStyleSheet(
+                "QPushButton#btn_update_params { background-color: #16a34a; color: #ffffff; border: 1px solid #15803d; font-weight: 700; border-radius: 4px; padding: 4px 8px; }"
+            )
+            QTimer.singleShot(1500, self._restore_update_btn_style)
+
+    def _restore_update_btn_style(self):
+        if hasattr(self, "btn_update_params"):
+            self.btn_update_params.setText("Update")
+            is_light = (self.theme == "light")
+            if is_light:
+                self.btn_update_params.setStyleSheet(
+                    "QPushButton#btn_update_params { background-color: #0284c7; color: #ffffff; border: 1px solid #0369a1; font-weight: 700; border-radius: 4px; padding: 4px 8px; }"
+                    "QPushButton#btn_update_params:hover { background-color: #0369a1; }"
+                )
+            else:
+                self.btn_update_params.setStyleSheet(
+                    "QPushButton#btn_update_params { background-color: #0284c7; color: #ffffff; border: 1px solid #38bdf8; font-weight: 700; border-radius: 4px; padding: 4px 8px; }"
+                    "QPushButton#btn_update_params:hover { background-color: #0ea5e9; }"
+                )
 
     def request_state_change(self, bypass_confirm=False):
         target_state = self.current_selected_state_key()
@@ -2445,10 +3031,10 @@ Categories=Science;Utility;
                     )
                     return
                 cycle_desc = (
-                    "Current procedure will verify Pot < 3.2 K, heat charcoal to 55 K, "
+                    "Current procedure will verify 3K starting temp < 3.2 K, heat charcoal to 55 K, "
                     "condense He-3 (3.5 h), and cool charcoal to reach ~300 mK without touching the magnet."
                     if target_state == "he3_only_cycle" else
-                    "Current procedure will verify Pot < 3.2 K, heat charcoal to 55 K, "
+                    "Current procedure will verify 3K starting temp < 3.2 K, heat charcoal to 55 K, "
                     "ramp ADR to full field, condense He-3 (3.5 h), and demag."
                 )
                 reply = QMessageBox.question(
@@ -2495,6 +3081,17 @@ Categories=Science;Utility;
                     "Are you absolutely sure you want to proceed?",
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No
                 )
+            elif target_state == "regulate_temperature":
+                target_mk = float(self.spin_reg_temp.value())
+                target_k = target_mk / 1000.0
+                disp_target = f"{target_mk:.1f} mK" if target_mk < 1000.0 else f"{target_k:.3f} K"
+                reply = QMessageBox.question(
+                    self,
+                    'Confirm Temperature Regulation',
+                    f'Switch to closed-loop temperature regulation at {disp_target}?',
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
             else:
                 reply = QMessageBox.question(self, 'Confirm Procedure',
                                              f'Switch to procedure: {disp_name}?',
@@ -2502,6 +3099,7 @@ Categories=Science;Utility;
             if reply != QMessageBox.Yes:
                 return
 
+        self._sync_adr_config_to_world()
         self.previewing_state = None
         self.dismiss_operator_banner()
 
@@ -2518,21 +3116,18 @@ Categories=Science;Utility;
         clean_source = '\n'.join(clean_lines)
 
         orig_state = self.states_dict.get(target_state)
-        orig_content = (orig_state.display_source if orig_state and orig_state.display_source is not None 
-                        else (orig_state.raw_source if orig_state else ""))
-        is_unmodified = (orig_state is not None and clean_source.strip() == orig_content.strip())
-
-        if is_unmodified or not self.expert_mode:
-            self.data_thread.next_state = orig_state
-            self.data_thread.paused = False
+        # If running via external command / bypass, or standard state in states_dict, run orig_state directly
+        if bypass_confirm or (target_state in self.states_dict and not getattr(self, "_editor_user_modified", False)):
+            if hasattr(self, "data_thread"):
+                self.data_thread.next_state = orig_state
+                self.data_thread.paused = False
             self.btn_pause.setText("Pause")
             self._set_status_badge("RUNNING", "running")
             self.lbl_script_name.setText(f"Active Script: {disp_name}")
             return
 
         try:
-            from imperative_statemachine import State, insert_line_number_yields, collect_exits, remove_decorators
-            from custom_script_loader import parse_txt_to_python
+            from engine import State, insert_line_number_yields, collect_exits, remove_decorators, parse_txt_to_python
             import states as states_module
 
             py_source = parse_txt_to_python(target_state, clean_source)
@@ -2651,8 +3246,23 @@ Categories=Science;Utility;
         self.update_plot()
 
     # ------------- Plot Interaction ---------------
+    def _on_plot_tab_index_changed(self, index):
+        if hasattr(self, 'plot_view_tabs') and 0 <= index < self.plot_view_tabs.count():
+            tab_name = self.plot_view_tabs.tabText(index)
+            self.on_view_changed(tab_name)
+
     def on_view_changed(self, text):
         self.active_plot_tab = text
+        if hasattr(self, 'plot_view_tabs'):
+            for i in range(self.plot_view_tabs.count()):
+                t = self.plot_view_tabs.tabText(i).lower()
+                req = text.lower()
+                if t == req or (req in ("pressures", "pressure") and t in ("pressures", "pressure")):
+                    if self.plot_view_tabs.currentIndex() != i:
+                        self.plot_view_tabs.blockSignals(True)
+                        self.plot_view_tabs.setCurrentIndex(i)
+                        self.plot_view_tabs.blockSignals(False)
+                    break
         self.user_has_zoomed = False
         self.update_plot()
 
@@ -2733,8 +3343,6 @@ Categories=Science;Utility;
         self.user_has_zoomed = False
         self._drag_active = False
         self._drag_start_ax = None
-        if hasattr(self, 'toolbar') and self.toolbar is not None:
-            self.toolbar.update()
         self.update_plot()
 
     def mpl_on_click(self, event):
@@ -2753,6 +3361,9 @@ Categories=Science;Utility;
 
     def mpl_on_release(self, event):
         if event.button == 1:
+            if getattr(self, "_drag_has_moved", False):
+                if hasattr(self, "_zoom_update_timer"):
+                    self._zoom_update_timer.start(10)
             self._drag_active = False
             self._drag_start_ax = None
 
@@ -2840,6 +3451,8 @@ Categories=Science;Utility;
 
         self.user_has_zoomed = True
         self.canvas.draw_idle()
+        if hasattr(self, "_zoom_update_timer"):
+            self._zoom_update_timer.start(25)
 
     def mpl_on_mouse_move(self, event):
         self.on_mouse_move_event = event
@@ -2911,7 +3524,7 @@ Categories=Science;Utility;
             "cryocon_chB_temperature": ["cryocon_chB_temperature", "chB_temperature", "chB", "charcoal"],
             "cryocon_chC_temperature": ["cryocon_chC_temperature", "chC_temperature", "chC", "4k_flange", "4k"],
             "cryocon_chD_temperature": ["cryocon_chD_temperature", "chD_temperature", "chD", "pot"],
-            "cryocon_chA_temperature": ["cryocon_chA_temperature", "chA_temperature", "chA", "40k_flange", "40k"],
+            "cryocon_chA_temperature": ["cryocon_chA_temperature", "chA_temperature", "chA", "60k_flange", "60k", "40k_flange", "40k"],
             "faa_temperature": ["faa_temperature", "faa"],
             "labjack_he3_pressure": ["labjack_he3_pressure", "he3_pressure"],
             "labjack_kepco_current": ["labjack_kepco_current", "kepco_current"],
@@ -2987,12 +3600,20 @@ Categories=Science;Utility;
 
         try:
             data = dataset.cache.data()
-            from plot_utils import get_time_vector, epoch_to_local_str
-            t = get_time_vector(dataset, data)
-            if t is None or len(t) == 0:
+            if not data or "time" not in data or "time" not in data["time"]:
                 return
-            xloc_ind = np.argmin(np.abs(t - event.xdata))
-            units = {p.name: p.unit for p in dataset.get_parameters()}
+            t = data["time"]["time"]
+            if len(t) == 0:
+                return
+            # Fast O(log N) binary search with zero array allocations
+            xloc_ind = int(np.searchsorted(t, event.xdata))
+            if xloc_ind >= len(t):
+                xloc_ind = len(t) - 1
+            elif xloc_ind > 0 and abs(t[xloc_ind - 1] - event.xdata) < abs(t[xloc_ind] - event.xdata):
+                xloc_ind = xloc_ind - 1
+
+            from plot_utils import get_dataset_units, epoch_to_local_str
+            units = get_dataset_units(dataset)
 
             shown_keys = [k for k in PRIMARY_STATUS_KEYS if k in data]
             other_keys = [k for k in data.keys() if k not in PRIMARY_STATUS_KEYS and k not in ("time", "elapsed_time")]
@@ -3034,7 +3655,14 @@ Categories=Science;Utility;
             self.lbl_phase_time.setText("Standing by")
             self.phase_progress_bar.setValue(100)
         else:
-            self.lbl_phase_name.setText(f"Step {step}/{tot_steps}: {phase_name}")
+            # Strip any redundant prefix like "Step X/Y:" or "X/Y:" if present
+            clean_phase = re.sub(r'^(?:Step\s+)?\d+/\d+:\s*', '', phase_name).strip()
+            # Strip any trailing timer annotations in parentheses, e.g. (2700s), (Remaining: 2h), (3.5h)
+            clean_phase = re.sub(r'\s*\((?:Remaining:\s*)?[\d\.]+\s*(?:s|m|h|min|sec|hours?|minutes?)[^\)]*\)$', '', clean_phase, flags=re.IGNORECASE).strip()
+            if tot_steps > 1:
+                self.lbl_phase_name.setText(f"Step {step}/{tot_steps}: {clean_phase}")
+            else:
+                self.lbl_phase_name.setText(clean_phase)
             rem_s = getattr(self.world, "to_wait_for_process_line", 0.0)
             wait_dur = getattr(self.world, "wait_duration_s", 0.0)
             if rem_s > 0 and wait_dur > 0:
@@ -3061,15 +3689,16 @@ Categories=Science;Utility;
                     self.combo_box.blockSignals(False)
 
             self.lbl_script_name.setText(f"Active Script: {disp_title}")
-            self.text_output.setReadOnly(False)
-            self.text_output.setText(s2)
-            textCursor = self.text_output.textCursor()
-            textCursor.setPosition(get_arrow_char_index(s2, plus=100))
-            color_line(self.text_output, get_arrow_linenum(s2), theme=self.theme)
-            self.text_output.setTextCursor(textCursor)
-
-        if not self.displaying_historical:
-            self.update_plot()
+            # Only update and recolor code text editor if visible in Expert mode and changed
+            if self.expert_mode and hasattr(self, "text_output"):
+                if getattr(self, "_last_rendered_s2", None) != s2:
+                    self._last_rendered_s2 = s2
+                    self.text_output.setReadOnly(False)
+                    self.text_output.setText(s2)
+                    textCursor = self.text_output.textCursor()
+                    textCursor.setPosition(get_arrow_char_index(s2, plus=100))
+                    color_line(self.text_output, get_arrow_linenum(s2), theme=self.theme)
+                    self.text_output.setTextCursor(textCursor)
 
     def update_plot(self):
         dataset = self.historical_dataset if self.displaying_historical else self.live_dataset

@@ -42,6 +42,10 @@ PARAM_UNITS = {
 
 PARAM_NAME_MAP = {
     "chA_temperature": "cryocon_chA_temperature",
+    "60k_flange": "cryocon_chA_temperature",
+    "60k": "cryocon_chA_temperature",
+    "40k_flange": "cryocon_chA_temperature",
+    "40k": "cryocon_chA_temperature",
     "chB_temperature": "cryocon_chB_temperature",
     "chC_temperature": "cryocon_chC_temperature",
     "chD_temperature": "cryocon_chD_temperature",
@@ -96,11 +100,11 @@ class DailyDatasetCache:
     def __init__(self, data_dict: Dict[str, Any], lock: Optional[threading.Lock] = None):
         self._data_dict = data_dict
         self._lock = lock
-        self._cached_arrays: Optional[Dict[str, Dict[str, np.ndarray]]] = None
+        self._cached_arrays: Dict[str, Dict[str, np.ndarray]] = {}
         self._cached_len: int = 0
 
     def invalidate(self):
-        self._cached_arrays = None
+        self._cached_arrays = {}
         self._cached_len = 0
 
     def data(self) -> Dict[str, Dict[str, np.ndarray]]:
@@ -117,13 +121,25 @@ class DailyDatasetCache:
         if min_len == 0:
             return {k: {k: np.array([])} for k in self._data_dict}
 
-        if self._cached_arrays is not None and self._cached_len == min_len:
+        if self._cached_len == min_len and self._cached_arrays:
             return self._cached_arrays
 
+        # Fast incremental update: append only new items since last cached point
+        if self._cached_arrays and self._cached_len > 0 and min_len > self._cached_len:
+            start = self._cached_len
+            for k, v in self._data_dict.items():
+                if k in self._cached_arrays and isinstance(v, (list, tuple)):
+                    new_slice = np.array(v[start:min_len])
+                    if len(new_slice) > 0:
+                        self._cached_arrays[k][k] = np.concatenate([self._cached_arrays[k][k], new_slice])
+            self._cached_len = min_len
+            return self._cached_arrays
+
+        # Initial full build or cache reset
         res = {}
         for k, v in self._data_dict.items():
             if isinstance(v, (list, tuple)):
-                res[k] = {k: np.array(list(v[:min_len]))}
+                res[k] = {k: np.array(v[:min_len])}
             elif isinstance(v, np.ndarray):
                 res[k] = {k: np.array(v[:min_len])}
             else:
@@ -771,7 +787,7 @@ def save_hardware_state(magnet_current: float = 0.0,
         "active_procedure": str(active_procedure),
         "phase_name": str(phase_name),
         "temperatures": temperatures or {},
-        "heatswitches": heatswitches or {"pot": "CLOSED", "adr": "CLOSED", "charcoal": "CLOSED"},
+        "heatswitches": heatswitches or {"pot": "CLOSED", "adr": "CLOSED", "charcoal": "OPEN"},
         "status": "HELD_SAFE",
         "notice": "Physical instrument settings (Lake Shore 370 DAC, Cryo-con, LabJack relays) held without reset."
     }

@@ -1,3 +1,0 @@
-# Open Charcoal Heat Switch
-open heatswitch charcoal
-return wait_forever

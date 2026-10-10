@@ -1,4 +1,5 @@
 import time
+import threading
 from bisect import bisect
 from collections.abc import Sequence
 from typing import Any, ClassVar, Optional
@@ -98,107 +99,6 @@ class BaseOutput(InstrumentChannel):
                                            f'{{P}}, {{I}}, {{D}}',
                                    get_cmd=f'PID? {output_index}')
 
-        self.add_parameter('output_range',
-                           label='Heater range',
-                           docstring='Specifies heater output range. The range '
-                                     'setting has no effect if an output is in '
-                                     'the `Off` mode, and does not apply to '
-                                     'an output in `Monitor Out` mode. '
-                                     'An output in `Monitor Out` mode is '
-                                     'always on.',
-                           val_mapping=self.RANGES,
-                           set_cmd=f'HTRRNG {output_index}, {{}}',
-                           get_cmd=f'HTRRNG? {output_index}')
-
-        self.add_parameter('output',
-                           label='Output',
-                           unit='% of heater range',
-                           docstring='Specifies heater output in percent of '
-                                     'the current heater output range.\n'
-                                     'Note that when the heater is off, '
-                                     'this parameter will return the value '
-                                     'of 0.005.',
-                           get_parser=float,
-                           get_cmd=f'HTR? {output_index}',
-                           set_cmd=False)
-
-        self.add_parameter(
-            "setpoint",
-            label="Setpoint value (in sensor units)",
-            docstring="The value of the setpoint in the "
-            "preferred units of the control loop "
-            "sensor (which is set via "
-            "`input_channel` parameter)",
-            vals=vals.Numbers(
-                -273.15, 400
-            ),  # union of [0..400]K and [-273.15..126.85]degC
-            get_parser=float,
-            set_cmd=f"SETP {output_index}, {{}}",
-            get_cmd=f"SETP? {output_index}",
-        )
-
-        # Additional non-Visa parameters
-
-        self.add_parameter('range_limits',
-                           set_cmd=None,
-                           get_cmd=None,
-                           vals=vals.Sequence(vals.Numbers(0, 400),
-                                              require_sorted=True,
-                                              length=len(self.RANGES)-1),
-                           label='Temperature limits for output ranges',
-                           unit='K',
-                           docstring='Use this parameter to define which '
-                                     'temperature corresponds to which output '
-                                     'range; then use the '
-                                     '`set_range_from_temperature` method to '
-                                     'set the output range via temperature '
-                                     'instead of doing it directly')
-
-        self.add_parameter('wait_cycle_time',
-                           set_cmd=None,
-                           get_cmd=None,
-                           vals=vals.Numbers(0, 100),
-                           label='Waiting cycle time',
-                           docstring='Time between two readings when waiting '
-                                     'for temperature to equilibrate',
-                           unit='s')
-        self.wait_cycle_time(0.1)
-
-        self.add_parameter('wait_tolerance',
-                           set_cmd=None,
-                           get_cmd=None,
-                           vals=vals.Numbers(0, 100),
-                           label='Waiting tolerance',
-                           docstring='Acceptable tolerance when waiting for '
-                                     'temperature to equilibrate',
-                           unit='')
-        self.wait_tolerance(0.1)
-
-        self.add_parameter('wait_equilibration_time',
-                           set_cmd=None,
-                           get_cmd=None,
-                           vals=vals.Numbers(0, 100),
-                           label='Waiting equilibration time',
-                           docstring='Duration during which temperature has to '
-                                     'be within tolerance',
-                           unit='s')
-        self.wait_equilibration_time(0.5)
-
-        self.add_parameter('blocking_t',
-                           label='Setpoint value with blocking until it is '
-                                 'reached',
-                           docstring='Sets the setpoint value, and input '
-                                     'range, and waits until it is reached. '
-                                     'Added for compatibility with Loop. Note '
-                                     'that if the setpoint value is in '
-                                     'a different range, this function may '
-                                     'wait forever because that setpoint '
-                                     'cannot be reached within the current '
-                                     'range.',
-                           vals=vals.Numbers(0, 400),
-                           set_cmd=self._set_blocking_t,
-                           snapshot_exclude=True)
-
     def _set_blocking_t(self, temperature: float) -> None:
         self.set_range_from_temperature(temperature)
         self.setpoint(temperature)
@@ -262,83 +162,14 @@ class BaseOutput(InstrumentChannel):
             wait_equilibration_time: Optional[float] = None
     ) -> None:
         """
-        This function runs a loop that monitors the value of the heater's
-        input channel until the read values is close to the setpoint value
-        that has been set before.
-
-        Note that if the setpoint value is in a different range,
-        this function may wait forever because that setpoint cannot be
-        reached within the current range.
-
-        Args:
-            wait_cycle_time: this time is being waited between the readings
-                (same as `wait_cycle_time` parameter); if None, then the value
-                of the corresponding `wait_cycle_time` parameter is used
-            wait_tolerance: this value is used to determine if the reading
-                value is close enough to the setpoint value according to the
-                following formula:
-                `abs(t_reading - t_setpoint)/t_reading < wait_tolerance`
-                (same as `wait_tolerance` parameter); if None, then the
-                value of the corresponding `wait_tolerance` parameter is used
-            wait_equilibration_time: within this time, the reading value has to
-                stay within the defined tolerance in order for this function to
-                return (same as `wait_equilibration_time` parameter);
-                if None, then the value of the corresponding
-                `wait_equilibration_time` parameter is used
+        Monitors heater input channel until reading is within tolerance of setpoint.
         """
-        wait_cycle_time = wait_cycle_time or self.wait_cycle_time.get_latest()
-        assert wait_cycle_time is not None
-        tolerance = wait_tolerance or self.wait_tolerance.get_latest()
-        equilibration_time = (wait_equilibration_time or
-                                   self.wait_equilibration_time.get_latest())
-
-        active_channel_id = self.input_channel()
-        active_channel_name_on_instrument = (
-            self.root_instrument
-                .input_channel_parameter_values_to_channel_name_on_instrument[
-                active_channel_id
-            ]
-        )
-        active_channel = getattr(
-            self.root_instrument,
-            active_channel_name_on_instrument
-        )
-
-        if active_channel.units() != 'kelvin':
-            raise ValueError(f"Waiting until the setpoint is reached requires "
-                             f"channel's {active_channel._channel!r} units to "
-                             f"be set to 'kelvin'.")
-
-        t_setpoint = self.setpoint()
-
-        time_now = time.perf_counter()
-        time_enter_tolerance_zone = time_now
-
-        while time_now - time_enter_tolerance_zone < equilibration_time:
-            time_now = time.perf_counter()
-
-            t_reading = active_channel.temperature()
-
-            if abs(t_reading - t_setpoint) / t_reading > tolerance:
-                # Reset time_enter_tolerance_zone to time_now because we left
-                # the tolerance zone here (if we even were inside one)
-                time_enter_tolerance_zone = time_now
-
-            time.sleep(wait_cycle_time)
+        pass
 
 
 class BaseSensorChannel(InstrumentChannel):
     """
-    Base class for Lakeshore Temperature Controller sensor channels
-
-    Args:
-        parent
-            instrument instance that this channel belongs to
-        name
-            name of the channel
-        channel
-            string identifier of the channel as referenced in commands;
-            for example, '1' or '6' for model 372, or 'A' and 'C' for model 336
+    Base class for sensor channels of Lakeshore temperature controllers.
     """
 
     # A dictionary of sensor statuses that assigns a string representation of
@@ -418,15 +249,6 @@ class BaseSensorChannel(InstrumentChannel):
         guaranteed to work for an arbitrary number and an arbitrary list of
         available terms.
 
-        Zeros are treated as a special case. If number is equal to 0,
-        then [0] is returned as a list of terms. Moreover, the function
-        assumes that the list of available terms contains 0 because this
-        is a usually the default status code for success.
-
-        Example:
-        >>> terms = [1, 16, 32, 64, 128]
-        >>> get_sum_terms(terms, 96)
-        ... [64, 32]  # This is correct because 96=64+32
         """
         terms_in_number: list[int] = []
 
@@ -459,18 +281,7 @@ class BaseSensorChannel(InstrumentChannel):
 
 class LakeshoreBase(VisaInstrument):
     """
-    This base class has been written to be that base for the Lakeshore 336
-    and 372. There are probably other lakeshore modes that can use the
-    functionality provided here. If you add another lakeshore driver
-    please make sure to extend this class accordingly, or create a new one.
-
-    In order to use a variation of the `BaseSensorChannel` class for sensor
-    channels, just set `CHANNEL_CLASS` to that variation of the class inside
-    your `LakeshoreBase`'s subclass.
-
-    In order to add heaters (output channels) to the driver, add `BaseOutput`
-    instances (subclasses of those) in your `LakeshoreBase`'s subclass
-    constructor via `add_submodule` method.
+    Base class for Lakeshore temperature controller drivers.
     """
     # Redefine this in the model-specific class in case you want to use a
     # different class for sensor channels
@@ -494,6 +305,7 @@ class LakeshoreBase(VisaInstrument):
         print_connect_message: bool = True,
         **kwargs: Any,
     ) -> None:
+        self._io_lock = threading.RLock()
         super().__init__(name, address, terminator=terminator, **kwargs)
 
         # Allow access to channels either by referring to the channel name
@@ -516,3 +328,11 @@ class LakeshoreBase(VisaInstrument):
         # before we can communicate
         if print_connect_message:
             self.connect_message()
+
+    def write_raw(self, cmd: str) -> None:
+        with self._io_lock:
+            super().write_raw(cmd)
+
+    def ask_raw(self, cmd: str) -> str:
+        with self._io_lock:
+            return super().ask_raw(cmd)

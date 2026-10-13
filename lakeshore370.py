@@ -3,22 +3,28 @@ from typing import Any, ClassVar
 from pyvisa.highlevel import ResourceManager
 from pyvisa.resources.messagebased import MessageBasedResource
 import qcodes.validators as vals
-from lakeshore370_base import (
-    BaseOutput,
-    BaseSensorChannel,
-    LakeshoreBase,
-)
+try:
+    from .lakeshore370_base import (
+        BaseOutput,
+        BaseSensorChannel,
+        LakeshoreBase,
+    )
+except ImportError:
+    from lakeshore370_base import (
+        BaseOutput,
+        BaseSensorChannel,
+        LakeshoreBase,
+    )
 from qcodes.instrument import InstrumentChannel
 from qcodes.parameters import Group, GroupParameter
-from bisect import bisect
 
 
-# There are 16 sensors channels (a.k.a. measurement inputs) in Model 372
+# There are 16 sensor channels (measurement inputs) in Model 370
 _n_channels = 16
 
 
 class LakeshoreModel370Output(InstrumentChannel):
-    """An InstrumentChannel for control outputs (heaters) of Lakeshore Model 372"""
+    """An InstrumentChannel for control outputs (heaters) of Lakeshore Model 370"""
 
     MODES: ClassVar[dict[str, int]] = {
         "closed": 1,
@@ -55,15 +61,14 @@ class LakeshoreModel370Output(InstrumentChannel):
         self.add_parameter("mode",
                            val_mapping=self.MODES,
                            get_cmd="CMODE?",
-                           set_cmd=f"CMODE {{}}")
+                           set_cmd="CMODE {}")
         
         self.add_parameter("range",
-                           val_mapping = self.RANGES,
+                           val_mapping=self.RANGES,
                            get_cmd="HTRRNG?",
                            set_cmd="HTRRNG {}")
 
-        # Add more parameters for CSET command
-        # and redefine the corresponding group
+        # Add parameters for CSET command
         self.add_parameter(
             "channel",
             label="channel to control",
@@ -93,329 +98,66 @@ class LakeshoreModel370Output(InstrumentChannel):
                 self.use_filter,
                 self.delay,
             ],
-            set_cmd=f"CSET {{channel}}, {{use_filter}}, {{delay}}, 1, 8, 50",
-            get_cmd=f"CSET?",
+            set_cmd="CSET {channel}, {use_filter}, 1, {delay}, 1, 4, 100",
+            get_cmd="CSET?",
         )
         self.add_parameter('P',
-                               label='Proportional (closed-loop)',
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-        #     "(excitation on), or shunted "
-        #     "(excitation off)",
-        #     val_mapping={False: 0, True: 1},
-        #     parameter_class=GroupParameter,
-        # )
-        # self.add_parameter(
-        #     "units",
-        #     label="Preferred units",
-        #     docstring="Specifies the preferred units parameter "
-        #     "for sensor readings and for the control "
-        #     "setpoint (kelvin or ohms)",
-        #     val_mapping={"kelvin": 1, "ohms": 2},
-        #     parameter_class=GroupParameter,
-        # )
-        # self.output_group = Group(
-        #     [
-        #         self.excitation_mode,
-        #         self.excitation_range_number,
-        #         self.auto_range,
-        #         self.range,
-        #         self.current_source_shunted,
-        #         self.units,
-        #     ],
-        #     set_cmd=f"INTYPE {self._channel}, "
-        #     f"{{excitation_mode}}, "
-        #     f"{{excitation_range_number}}, "
-        #     f"{{auto_range}}, {{range}}, "
-        #     f"{{current_source_shunted}}, "
-        #     f"{{units}}",
-        #     get_cmd=f"INTYPE? {self._channel}",
-        # )
+                           label='Proportional (closed-loop)',
+                           docstring='The value for closed control loop Proportional (gain)',
+                           vals=vals.Numbers(0, 1000),
+                           get_parser=float,
+                           parameter_class=GroupParameter)
+        self.add_parameter('I',
+                           label='Integral (closed-loop)',
+                           docstring='The value for closed control loop Integral (reset)',
+                           vals=vals.Numbers(0, 1000),
+                           get_parser=float,
+                           parameter_class=GroupParameter)
+        self.add_parameter('D',
+                           label='Derivative (closed-loop)',
+                           docstring='The value for closed control loop Derivative (rate)',
+                           vals=vals.Numbers(0, 1000),
+                           get_parser=float,
+                           parameter_class=GroupParameter)
+        self.pid_group = Group([self.P, self.I, self.D],
+                               set_cmd='PID {P}, {I}, {D}',
+                               get_cmd='PID?')
+        
+        self.add_parameter(
+            "setpoint",
+            label="Setpoint value (in sensor units)",
+            docstring="The value of the setpoint in the preferred units of the control loop",
+            unit="K",
+            vals=vals.Numbers(0, 300),
+            get_parser=float,
+            set_cmd="SETP {}",
+            get_cmd="SETP?",
+        )
+
+    def setup_control(self, channel: int = 4, p: float = 0.05, i: float = 12.0, d: float = 0.0) -> None:
+        """Configure Lake Shore 370 closed loop control channel (Kelvin units) and PID gains."""
+        self.write(f"CSET {int(channel)}, 1, 1, 1, 1, 4, 100")
+        self.write(f"PID {float(p)}, {float(i)}, {float(d)}")
+
+        self.add_parameter('wait_cycle_time',
+                           set_cmd=None,
+                           get_cmd=None,
+                           initial_value=0.1,
+                           vals=vals.Numbers(0, 1),
+                           label='Wait cycle time',
+                           docstring='Time between readings in wait_until')
+
+
+class LakeshoreModel370Channel(BaseSensorChannel):
+    """
+    Sensor channel for Lakeshore Model 370.
+    """
+    pass
 
 
 class LakeshoreModel370(LakeshoreBase):
     """
     QCoDeS driver for Lakeshore Model 370 Temperature Controller.
-
-    Note that interaction with the control input (referred to as 'A' in the
-    Computer Interface Operation section of the manual) is not implemented.
     """
 
     channel_name_command: ClassVar[dict[str, str]] = {
@@ -433,11 +175,8 @@ class LakeshoreModel370(LakeshoreBase):
         self.add_submodule("heater", LakeshoreModel370Output(self, output_name="heater"))
 
     def _open_resource(self, address: str, visalib: str | None) -> tuple[MessageBasedResource, str, ResourceManager]:
-        # first call the existing _open_resource method
         resource, visabackend, resource_manager = super()._open_resource(address, visalib)
-        # then set the odd communication settings that can't be passed by argument with the current api
         from pyvisa import constants
         resource.parity = constants.Parity.odd
         resource.data_bits = 7
         return resource, visabackend, resource_manager
-    

@@ -98,7 +98,7 @@ class LakeshoreModel370Output(InstrumentChannel):
                 self.use_filter,
                 self.delay,
             ],
-            set_cmd="CSET {channel}, {use_filter}, {delay}, 1, 8, 50",
+            set_cmd="CSET {channel}, {use_filter}, 1, {delay}, 1, 4, 100",
             get_cmd="CSET?",
         )
         self.add_parameter('P',
@@ -133,6 +133,11 @@ class LakeshoreModel370Output(InstrumentChannel):
             set_cmd="SETP {}",
             get_cmd="SETP?",
         )
+
+    def setup_control(self, channel: int = 4, p: float = 0.05, i: float = 12.0, d: float = 0.0) -> None:
+        """Configure Lake Shore 370 closed loop control channel (Kelvin units) and PID gains."""
+        self.write(f"CSET {int(channel)}, 1, 1, 1, 1, 4, 100")
+        self.write(f"PID {float(p)}, {float(i)}, {float(d)}")
 
         self.add_parameter('wait_cycle_time',
                            set_cmd=None,

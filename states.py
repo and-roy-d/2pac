@@ -23,23 +23,48 @@ def _get_log_dir():
     log_dir = d
     return d
 
+_open_log_handles = {}
+_current_log_day = None
+
 def _log_to_file(results_list):
-    """Append each channel value to its own .log file."""
+    """Append each channel value to its own .log file with persistent line-buffered file handles."""
+    global _open_log_handles, _current_log_day
     d = _get_log_dir()
+    today = d.name
+    if today != _current_log_day:
+        for h in _open_log_handles.values():
+            try:
+                h.close()
+            except Exception:
+                pass
+        _open_log_handles.clear()
+        _current_log_day = today
+
     now = time.time()
     local_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     for item in results_list:
         if isinstance(item, tuple) and len(item) == 2:
             param, value = item
-            # Get the channel name
             if isinstance(param, str):
                 name = param
             else:
                 name = getattr(param, 'name', str(param))
-            # Write to file
-            log_file = d / f"{name}.log"
-            with open(log_file, "a") as f:
-                f.write(f"{now},{local_time},{value}\n")
+            
+            handle = _open_log_handles.get(name)
+            if handle is None or handle.closed:
+                log_file = d / f"{name}.log"
+                handle = open(log_file, "a", buffering=1, encoding="utf-8")
+                _open_log_handles[name] = handle
+            try:
+                handle.write(f"{now},{local_time},{value}\n")
+            except Exception:
+                try:
+                    log_file = d / f"{name}.log"
+                    handle = open(log_file, "a", buffering=1, encoding="utf-8")
+                    _open_log_handles[name] = handle
+                    handle.write(f"{now},{local_time},{value}\n")
+                except Exception:
+                    pass
 
 def retry(f, n=3):
     # try cryocon is being unreliable on returning temp, so try a few times then return nan
@@ -51,6 +76,11 @@ def retry(f, n=3):
     return np.nan
 
 def update(datasaver, state):
+    global st
+    if st is None and hasattr(datasaver, "station") and datasaver.station is not None:
+        st = datasaver.station
+    if st is None:
+        return
     ls370_out = retry(st.ls370.heater.out, n=1) if hasattr(st, "ls370") and st.ls370 is not None else np.nan
     faa_val = retry(st.ls370.ch04.temperature, n=2) if hasattr(st, "ls370") and st.ls370 is not None else np.nan
 
@@ -171,12 +201,27 @@ MAGNET_START_LIMIT_A = 0.2       # refuse to start a cycle above this magnet cur
 def check_magnet_deenergized(world):
     """Raise if the magnet is (or may be) energized. NaN / read failure counts as unsafe."""
     try:
+        cur_relay = world.station.labjack.relay.cache.get()
+    except Exception:
+        cur_relay = None
+    if cur_relay == "CONTROL":
+        return 0.0
+
+    try:
         mag_I = float(world.station.labjack.kepco_current())
     except Exception as e:
         raise RuntimeError(f"Refusing to start: cannot read magnet current ({e}).")
-    if not np.isfinite(mag_I) or abs(mag_I) > MAGNET_START_LIMIT_A:
+
+    try:
+        mag_V = float(world.station.labjack.kepco_voltage())
+    except Exception:
+        mag_V = 0.0
+
+    effective_limit = 0.6 if abs(mag_V) < 0.15 else MAGNET_START_LIMIT_A
+
+    if not np.isfinite(mag_I) or abs(mag_I) > effective_limit:
         raise RuntimeError(
-            f"Refusing to start: magnet current is {mag_I:.3f} A (limit {MAGNET_START_LIMIT_A} A). "
+            f"Refusing to start: magnet current is {mag_I:.3f} A (limit {effective_limit:.1f} A). "
             "Run 'Ramp Down Magnet' first.")
     return mag_I
 
@@ -259,14 +304,17 @@ def he3_adr_cycle(world: StationWorld):
     # Operator must close the green He-3 valve BEFORE step 1 (also confirmed in GUI)
     print("CLOSE THE GREEN HE3 VALVE")
 
-    # 1. set heat switches and check that we're cold enough to start
-    world.set_phase(f"Pre-cooling Check (3K < {limit_3k:.1f}K)", 1, 6)
+    # 1. Close all heat switches in the beginning and wait 30 seconds before switching relay to RAMP
+    world.set_phase(f"Pre-cooling: Closing All Heat Switches (30s settle)", 1, 6)
     safe_set_heatswitch(world, "pot", "CLOSED")
     world.wait(1)
     safe_set_heatswitch(world, "adr", "CLOSED")
     world.wait(1)
-    safe_set_heatswitch(world, "charcoal", "OPEN")
-    world.wait(1)
+    safe_set_heatswitch(world, "charcoal", "CLOSED")
+    world.wait(30)
+
+    # Pre-cooling temperature check (ensure 3K stage is cold enough)
+    world.set_phase(f"Pre-cooling Check (3K < {limit_3k:.1f}K)", 1, 6)
     while True:
         mr = most_recent_measurements()
         c_temp = mr.get("cryocon_chC_temperature")
@@ -274,8 +322,21 @@ def he3_adr_cycle(world: StationWorld):
             break
         world.wait(1)
 
-    # 2. start heating charcoal
+    # 2. Switch relay to RAMP and ensure current starts from zero
+    world.station.labjack.relay("RAMP")
+    world.wait(1)
+    ramp_controller = world.station.ls370.heater
+    ramp_controller.mode('open_loop')
+    world.wait(1)
+    ramp_controller.out(0.0)
+    world.wait(1)
+    ramp_controller.range("100uA")
+    world.wait(1)
+
+    # 3. Open charcoal heatswitch and start heating sorption charcoal
     world.set_phase(f"Heating Sorption Charcoal ({charcoal_sp:.0f}K)", 2, 6)
+    safe_set_heatswitch(world, "charcoal", "OPEN")
+    world.wait(1)
     world.station.cryocon.loop1_source("A")
     world.wait(1)
     world.station.cryocon.loop1_setpoint(flange_sp)
@@ -289,15 +350,8 @@ def he3_adr_cycle(world: StationWorld):
     world.station.cryocon.control_enabled(True) # heat charcoal
     world.wait(1)
 
-    # 3. ramp up adr
-    world.set_phase("Ramping ADR Magnet Up", 3, 6)
-    world.station.labjack.relay("RAMP")
-    world.wait(1)
-    ramp_controller = world.station.ls370.heater
-    ramp_controller.mode('open_loop')
-    world.wait(1)
-    ramp_controller.range("100uA")
-    world.wait(1)
+    # 4. Ramp up ADR magnet current starting smoothly from zero
+    world.set_phase("Ramping ADR Magnet Up (0% -> max)", 3, 6)
 
     if testmode:
         t_hout = 1.0 # small max current
@@ -395,19 +449,8 @@ def he3_adr_cycle(world: StationWorld):
                     break
             world.wait(1)
 
-    target_k, target_mk = get_adr_regulation_setpoint(world)
-    reg_disp = f"{target_mk:.0f}mK" if target_mk < 1000.0 else f"{target_k:.3f}K"
-    world.station.labjack.relay("CONTROL")
-    world.wait(30)
-    ramp_controller.mode('closed')
-    world.wait(1)
-    ramp_controller.setpoint(target_k)
-    world.wait(1)
-    ramp_controller.range("100uA")
-
-    # be done
-    world.set_phase(f"Idle — Holding Steady (Regulating @ {reg_disp})", 1, 1)
-    return wait_forever
+    # 8. Demag complete: transition directly to closed-loop temperature regulation holding state
+    return regulate_temperature
 
 @state
 def ramp_down_magnet(world: StationWorld):
@@ -419,11 +462,21 @@ def ramp_down_magnet(world: StationWorld):
     mode_now = rc.mode()
     start_hout = float(rc.out())
     if mode_now != "open_loop":
-        print(f"ramp_down_magnet: LS370 heater in '{mode_now}' mode, not open_loop; magnet not under ramp control, nothing to do.")
-        world.set_phase("Idle — Holding Steady", 1, 1)
+        print(f"ramp_down_magnet: LS370 heater in '{mode_now}' mode; safely resetting to open_loop 0.0% and disabling heater range.")
+        rc.mode("open_loop")
+        world.wait(1)
+        rc.out(0.0)
+        world.wait(1)
+        rc.range("off")
+        world.wait(1)
+        world.station.labjack.relay("RAMP")
+        world.set_phase("Idle — Magnet De-energized & Heater Off", 1, 1)
         return wait_forever
     if not np.isfinite(start_hout) or start_hout <= 0:
-        world.set_phase("Idle — Holding Steady", 1, 1)
+        rc.out(0.0)
+        rc.range("off")
+        world.station.labjack.relay("RAMP")
+        world.set_phase("Idle — Holding Steady (0A)", 1, 1)
         return wait_forever
     cfg = get_adr_config(world)
     max_hout = float(cfg.get("magnet_max_hout", MAGNET_MAX_HOUT))
@@ -439,6 +492,11 @@ def ramp_down_magnet(world: StationWorld):
         if fraction >= 1.0:
             break
         world.wait(1)
+    rc.out(0.0)
+    world.wait(1)
+    rc.range("off")
+    world.wait(1)
+    world.station.labjack.relay("RAMP")
     world.set_phase("Idle — Holding Steady (magnet ramped down)", 1, 1)
     return wait_forever
 
@@ -511,12 +569,22 @@ def he3_only_cycle(world: StationWorld):
     condense_dwell_s = float(cfg.get("he3_condense_dwell_h", 3.5)) * 3600.0
     launch_temp_k = float(cfg.get("launch_temp_k", 1.0))
 
-    # 0. safety: check magnet is de-energized
+    # 0. safety: check magnet is de-energized and ensure relay is set to CONTROL (magnet isolated)
     check_magnet_deenergized(world)
+    if hasattr(world, "station") and hasattr(world.station, "labjack") and hasattr(world.station.labjack, "relay"):
+        try:
+            cur_rel = world.station.labjack.relay.cache.get()
+            if cur_rel != "CONTROL":
+                world.station.labjack.relay("CONTROL")
+                world.wait(1)
+        except Exception as e:
+            print(f"Warning setting relay to CONTROL: {e}")
+
     # Operator must close the green He-3 valve BEFORE step 1
     print("CLOSE THE GREEN HE3 VALVE")
 
     # 1. set heat switches and check that we're cold enough to start
+    # Pot and ADR heat switches are CLOSED so the FAA stage is connected to the He-3 pot
     world.set_phase(f"Pre-cooling Check (3K < {limit_3k:.1f}K)", 1, 4)
     safe_set_heatswitch(world, "pot", "CLOSED")
     world.wait(1)
@@ -554,9 +622,12 @@ def he3_only_cycle(world: StationWorld):
         world.wait(condense_dwell_s) # takes about 3.5 hours to condense He-3
 
     # 4. cool charcoal and wait for launch/base temperature
+    # Open pot heat switch to isolate 1K pot from 4K, but keep ADR switch CLOSED so FAA cools with pot
     disp_launch = f"{launch_temp_k * 1000.0:.0f}mK" if launch_temp_k < 1.0 else f"{launch_temp_k:.2f}K"
     world.set_phase(f"Cooling to Base Temp (FAA / Pot < {disp_launch})", 4, 4)
-    safe_set_heatswitch(world, "pot", "OPEN") # thermally isolate 1K pot
+    safe_set_heatswitch(world, "pot", "OPEN") # thermally isolate 1K pot from 4K bath
+    world.wait(1)
+    safe_set_heatswitch(world, "adr", "CLOSED") # keep ADR heat switch connected to the pot
     world.wait(1)
     world.station.cryocon.control_enabled(False) # turn off heaters
     if testmode:
@@ -564,6 +635,8 @@ def he3_only_cycle(world: StationWorld):
     else: 
         world.wait(120) # a bit of cooling before closing charcoal heatswitch
     safe_set_heatswitch(world, "charcoal", "CLOSED")  
+    world.wait(1)
+    safe_set_heatswitch(world, "adr", "CLOSED") # keep ADR heat switch connected to the pot
     world.wait(1)
     
     if testmode:
@@ -577,31 +650,142 @@ def he3_only_cycle(world: StationWorld):
                 break
             world.wait(1)
 
-    # Done — holding steady at base temperature
-    world.set_phase("Idle — Holding Steady (He-3 Cycle Complete)", 1, 1)
+    # Done — holding steady at base temperature with ADR heat switch connected to the pot
+    safe_set_heatswitch(world, "adr", "CLOSED")
+    world.set_phase("Idle — Holding Steady (He-3 Base Temp, ADR Switch Connected)", 1, 1)
     return wait_forever
 
 @state
 def regulate_temperature(world: StationWorld):
     """
-    Engage closed-loop PID temperature regulation on the Lake Shore 370.
-    Switches relay to CONTROL, sets heater mode to closed, applies setpoint,
-    and enables 100uA heater excitation range.
+    Engage closed-loop PID temperature regulation on the Lake Shore 370 in CONTROL mode.
+    Regulates stage temperature via physical stage heater resistor (relay switches to CONTROL).
+    Applies tuning: P=0.05, I=12, D=0, R=100 Ohm, 100uA range.
+    Holds indefinitely in this state and continuously checks for setpoint updates.
     """
+    check_magnet_deenergized(world)
+
     target_k, target_mk = get_adr_regulation_setpoint(world)
     disp_target = f"{target_mk:.1f} mK" if target_mk < 1000.0 else f"{target_k:.3f} K"
     world.set_phase(f"Regulating @ {disp_target}", 1, 1)
 
-    world.station.labjack.relay("CONTROL")
-    world.wait(2)
-    rc = world.station.ls370.heater
-    rc.mode('closed')
-    world.wait(1)
-    rc.setpoint(target_k)
-    world.wait(1)
-    rc.range("100uA")
-    world.set_phase(f"Idle — Holding Steady (Regulating @ {disp_target})", 1, 1)
-    return wait_forever
+    ls = getattr(world.station, "ls370", None)
+    rc = ls.heater if ls else None
+
+    try:
+        cur_relay = world.station.labjack.relay.cache.get()
+    except Exception:
+        cur_relay = None
+    if cur_relay != "CONTROL":
+        world.set_phase("Switching Relay to CONTROL (5s settle)", 1, 1)
+        if rc:
+            rc.mode('open_loop')
+            rc.out(0.0)
+            rc.range('off')
+        if ls:
+            try:
+                ls.write("RAMP 0, 0")
+            except Exception:
+                pass
+        world.station.labjack.relay("CONTROL")
+        world.wait(5)
+
+    # Load user-configured PID, R value, and ramp speed settings from gui_settings.json
+    pid_cfg = {}
+    try:
+        from pathlib import Path
+        import json
+        cfg_p = Path.home() / "2pac_logs" / "gui_settings.json"
+        if cfg_p.exists():
+            with open(cfg_p) as f:
+                pid_cfg = json.load(f).get("pid_config", {})
+    except Exception:
+        pid_cfg = {}
+
+    p_val = float(pid_cfg.get("p", 0.05))
+    i_val = float(pid_cfg.get("i", 12.0))
+    d_val = float(pid_cfg.get("d", 0.0))
+    r_val = float(pid_cfg.get("heater_resistance", 100.0))
+    ch_val = int(pid_cfg.get("channel", 4))
+    limit_val = int(pid_cfg.get("heater_limit", 4))
+    htr_range = str(pid_cfg.get("heater_range", "100uA"))
+    ramp_en = 1 if pid_cfg.get("ramp_enable", False) else 0
+    ramp_k = float(pid_cfg.get("ramp_rate_mk_min", 10.0)) / 1000.0
+
+    # 1. Configure Lake Shore 370 control loop parameters (CSET)
+    if ls:
+        try:
+            ls.write(f"CSET {ch_val}, 1, 1, 1, 1, {limit_val}, {r_val:.1f}")
+        except Exception as e:
+            print(f"Warning: could not set CSET on LS370: {e}")
+        world.wait(1)
+
+        # 2. Configure PID gains
+        try:
+            ls.write(f"PID {p_val:.4f}, {i_val:.1f}, {d_val:.1f}")
+        except Exception as e:
+            print(f"Warning: could not set PID on LS370: {e}")
+        world.wait(1)
+
+        # 3. Configure Setpoint Ramping
+        try:
+            ls.write(f"RAMP {ramp_en}, {ramp_k:.4f}")
+        except Exception as e:
+            print(f"Warning: could not set RAMP on LS370: {e}")
+        world.wait(1)
+
+        # 4. Lock scan to Control Channel so scanner does not hop during regulation
+        try:
+            ls.write(f"SCAN {ch_val}, 0")
+        except Exception as e:
+            print(f"Warning: could not set SCAN on LS370: {e}")
+        world.wait(1)
+
+    # 5. Enable closed loop PID mode
+    if rc:
+        try:
+            cur_mode = rc.mode.cache.get()
+        except Exception:
+            cur_mode = None
+        if cur_mode != "closed":
+            rc.mode('closed')
+            world.wait(1)
+
+        # 6. Set setpoint in Kelvin (AFTER entering closed loop so LS370 does not overwrite it with current temp)
+        rc.setpoint(target_k)
+        if ls:
+            try:
+                ls.write(f"SETP {target_k:.4f}")
+            except Exception:
+                pass
+        world.wait(1)
+
+        # 7. Enable heater excitation range
+        try:
+            rc.range(htr_range)
+        except Exception:
+            rc.range("100uA")
+
+    last_applied_sp = target_k
+    world.set_phase(f"Regulating @ {disp_target}", 1, 1)
+
+    while True:
+        cur_k, cur_mk = get_adr_regulation_setpoint(world)
+        if abs(cur_k - last_applied_sp) > 1e-6:
+            if ls:
+                try:
+                    ls.write(f"SETP {cur_k:.4f}")
+                except Exception:
+                    pass
+            if rc:
+                try:
+                    rc.setpoint(cur_k)
+                except Exception:
+                    pass
+            last_applied_sp = cur_k
+            cur_disp = f"{cur_mk:.1f} mK" if cur_mk < 1000.0 else f"{cur_k:.3f} K"
+            world.set_phase(f"Regulating @ {cur_disp}", 1, 1)
+        world.wait(1)
 
 @state
 def warmup_300K(world: StationWorld):
@@ -786,19 +970,8 @@ def resume_he3_adr_cycle(world: StationWorld):
                     break
             world.wait(1)
 
-    target_k, target_mk = get_adr_regulation_setpoint(world)
-    reg_disp = f"{target_mk:.0f}mK" if target_mk < 1000.0 else f"{target_k:.3f}K"
-    world.station.labjack.relay("CONTROL")
-    world.wait(30)
-    ramp_controller.mode('closed')
-    world.wait(1)
-    ramp_controller.setpoint(target_k)
-    world.wait(1)
-    ramp_controller.range("100uA")
-
-    # be done
-    world.set_phase(f"Idle — Holding Steady (Regulating @ {reg_disp})", 1, 1)
-    return wait_forever
+    # Demag complete: transition directly to closed-loop temperature regulation holding state
+    return regulate_temperature
 
 STATES_LIST = [
     wait_forever,

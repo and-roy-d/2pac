@@ -13,14 +13,14 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QComboBox, QTex
                              QScrollArea, QFrame, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView,
                              QListWidget, QListWidgetItem, QCheckBox, QSpinBox, QDoubleSpinBox, QFormLayout,
                              QProgressBar)
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QObject, QEvent
 from PyQt5.QtGui import QFont, QColor, QTextCursor, QTextCharFormat, QTextFormat, QIcon
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 import matplotlib.pyplot as plt
 import numpy as np
 
 from states import wait_forever
-from plot_utils import plot_dataset, CHANNEL_ALIASES, CHANNEL_COLORS, display_name, THEMES, format_cryo_temp
+from plot_utils import plot_dataset, CHANNEL_ALIASES, CHANNEL_COLORS, display_name, THEMES, format_cryo_temp, format_magnet_current
 
 SETTINGS_PATH = Path.home() / "2pac_logs" / "channel_aliases.json"
 
@@ -64,7 +64,9 @@ STATE_DESCRIPTIONS = {
     "ready_for_cooldown": "Closes all heat switches and sets He-3 setpoints (heaters off).\n"
                           "You will be asked to open the green He-3 valve.",
     "he3_only_cycle": "He-3 condensation cycle (no magnet / no ADR):\n"
-                      "Waits for 3K starting temp < 3.2 K, heats charcoal (55 K), dwells 3.5 h, and cools charcoal to launch/base temp (< 1.0 K).",
+                      "Heats charcoal (55 K), dwells 3.5 h, and cools charcoal to reach base temp (~300 mK).\n"
+                      "Keeps ADR heat switch connected (CLOSED) to the pot so the FAA stage cools with the pot.\n"
+                      "Relay is locked to CONTROL so the magnet remains de-energized.",
     "he3_adr_cycle": "Full He-3 / ADR cycle (~8 h total):\n"
                      "1. Pre-cool check: Verifies 3K starting temp (Ch C) < 3.2 K.\n"
                      "2. Heat charcoal (55 K) & RAMP MAGNET UP (0 -> 58.1%, 45 min) with ADR switch closed.\n"
@@ -138,6 +140,17 @@ DEFAULT_GUI_SETTINGS = {
         "demag_settle_min": 20.0,
         "regulate_temp_mk": 50.0,
         "regulate_temp_k": 0.050,
+    },
+    "pid_config": {
+        "p": 0.05,
+        "i": 12.0,
+        "d": 0.0,
+        "heater_resistance": 100.0,
+        "channel": 4,
+        "heater_limit": 4,
+        "heater_range": "100uA",
+        "ramp_enable": False,
+        "ramp_rate_mk_min": 10.0,
     }
 }
 
@@ -145,6 +158,7 @@ DEFAULT_GUI_SETTINGS = {
 def load_gui_settings():
     settings = dict(DEFAULT_GUI_SETTINGS)
     settings["adr_config"] = dict(DEFAULT_GUI_SETTINGS["adr_config"])
+    settings["pid_config"] = dict(DEFAULT_GUI_SETTINGS["pid_config"])
     try:
         if GUI_SETTINGS_PATH.exists():
             with open(GUI_SETTINGS_PATH) as f:
@@ -152,6 +166,8 @@ def load_gui_settings():
             for k, v in saved.items():
                 if k == "adr_config" and isinstance(v, dict):
                     settings["adr_config"].update(v)
+                elif k == "pid_config" and isinstance(v, dict):
+                    settings["pid_config"].update(v)
                 elif k in settings and isinstance(v, type(settings[k])) or (k in settings and isinstance(settings[k], float) and isinstance(v, int)):
                     settings[k] = v
     except Exception as e:
@@ -337,17 +353,25 @@ QHeaderView::section {
 }
 QScrollBar:vertical {
     border: none;
-    background: #090d16;
-    width: 6px;
-    margin: 0;
+    background: transparent;
+    width: 8px;
+    margin: 0px;
 }
 QScrollBar::handle:vertical {
     background: #334155;
-    min-height: 20px;
-    border-radius: 3px;
+    min-height: 25px;
+    border-radius: 4px;
 }
 QScrollBar::handle:vertical:hover {
     background: #475569;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+    background: none;
+    border: none;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: none;
 }
 QListWidget#state_list {
     background-color: #0b0f19;
@@ -574,17 +598,25 @@ QHeaderView::section {
 }
 QScrollBar:vertical {
     border: none;
-    background: #f8fafc;
-    width: 6px;
-    margin: 0;
+    background: transparent;
+    width: 8px;
+    margin: 0px;
 }
 QScrollBar::handle:vertical {
     background: #cbd5e1;
-    min-height: 20px;
-    border-radius: 3px;
+    min-height: 25px;
+    border-radius: 4px;
 }
 QScrollBar::handle:vertical:hover {
     background: #94a3b8;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+    background: none;
+    border: none;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: none;
 }
 QListWidget#state_list {
     background-color: #ffffff;
@@ -731,6 +763,32 @@ def color_line(textedit, line_number, color=None, theme="light"):
     textedit.setExtraSelections([sel])
 
 
+class ScrollAreaWheelForwarder(QObject):
+    """
+    Event filter installed on interactive child widgets (QComboBox, QSpinBox, QDoubleSpinBox, QPushButton)
+    inside a QScrollArea. Prevents accidental parameter alteration when the user rolls their
+    mouse scroll wheel over the controls, forwarding the wheel event directly to the scroll area
+    so the sidebar or tab scrolls smoothly instead of modifying values or getting stuck.
+    """
+    def __init__(self, scroll_area):
+        super().__init__(scroll_area)
+        self.scroll_area = scroll_area
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Wheel:
+            self.scroll_area.wheelEvent(event)
+            return True
+        return False
+
+
+def forward_child_wheel_events(scroll_area, container_widget):
+    """Install ScrollAreaWheelForwarder on all interactive input children of a container widget."""
+    forwarder = ScrollAreaWheelForwarder(scroll_area)
+    for child in container_widget.findChildren((QComboBox, QSpinBox, QDoubleSpinBox, QPushButton)):
+        child.installEventFilter(forwarder)
+    return forwarder
+
+
 class DataFetchThread(QThread):
     state_update = pyqtSignal(str, str)
     procedure_finished = pyqtSignal(str)
@@ -770,11 +828,10 @@ class DataFetchThread(QThread):
             if state_name == "ready_for_cooldown":
                 self.operator_action.emit(state_name, "⚠️ ACTION REQUIRED: Open the green He-3 valve on the cryostat.")
 
-            runner = self.world.state_runner(self.state)
-            self.world._update(self.state)
-            tstart = self.world.last_update_time_s
-
             try:
+                runner = self.world.state_runner(self.state)
+                self.world._update(self.state)
+                tstart = self.world.last_update_time_s
                 for (state, line_number) in runner:
                     if not self.running:
                         return
@@ -833,6 +890,9 @@ class DataFetchThread(QThread):
 
 
 class MyApp(QWidget):
+    sig_pid_status = pyqtSignal(str)
+    sig_pid_read = pyqtSignal(dict)
+
     @property
     def live_dataset(self):
         if hasattr(self, "daily_logger") and self.daily_logger and getattr(self.daily_logger, "dataset", None) is not None:
@@ -845,6 +905,9 @@ class MyApp(QWidget):
 
     def __init__(self, world, dataset, states_dict, daily_logger=None):
         super().__init__()
+
+        self.sig_pid_status.connect(self._handle_pid_status)
+        self.sig_pid_read.connect(self._handle_pid_read)
 
         load_aliases()
 
@@ -900,6 +963,12 @@ class MyApp(QWidget):
                 _p = getattr(self.world.station.labjack, f"heatswitch_{_k}", None)
                 if _p and hasattr(_p, "cache"):
                     _p.cache.set(self._hs_states.get(_k, "CLOSED" if _k != "charcoal" else "OPEN"))
+            _rel_p = getattr(self.world.station.labjack, "relay", None)
+            if _rel_p and hasattr(_rel_p, "cache"):
+                _saved_rel = "CONTROL"
+                if last_hw_init and "relay" in last_hw_init and last_hw_init["relay"] in ("CONTROL", "RAMP"):
+                    _saved_rel = last_hw_init["relay"]
+                _rel_p.cache.set(_saved_rel)
 
         # Left-click drag & pan state
         self._drag_active = False
@@ -964,14 +1033,18 @@ class MyApp(QWidget):
 
         self.metric_tiles = {}
         # Colors matched exactly to corresponding plot curves:
-        # FAA (Crimson Red #dc2626), Pot (Purple #7c3aed), Charcoal (Forest Green #059669),
-        # He-3 Pressure (Royal Blue #2563eb), Magnet Current (Deep Cyan #0891b2)
+        # 4K Flange (Amber / Bronze #d97706), Charcoal (Forest Green #059669),
+        # He-3 Pot (Purple #7c3aed), FAA Stage (Crimson Red #dc2626),
+        # He-3 Pressure (Royal Blue #2563eb), Magnet Current (Deep Cyan #0891b2),
+        # Relay / Setpoint (Slate Grey #475569)
         metric_specs = [
-            ("faa_temperature", "FAA STAGE", "#dc2626"),
-            ("cryocon_chD_temperature", "HE-3 POT", "#7c3aed"),
+            ("cryocon_chC_temperature", "4K FLANGE", "#d97706"),
             ("cryocon_chB_temperature", "CHARCOAL", "#059669"),
+            ("cryocon_chD_temperature", "HE-3 POT", "#7c3aed"),
+            ("faa_temperature", "FAA STAGE", "#dc2626"),
             ("labjack_he3_pressure", "HE-3 PRESSURE", "#2563eb"),
             ("labjack_kepco_current", "MAGNET CURRENT", "#0891b2"),
+            ("relay_heater_status", "RELAY STATE: —", "#475569"),
         ]
 
         for key, title, accent_color in metric_specs:
@@ -988,8 +1061,16 @@ class MyApp(QWidget):
 
             lbl_v = QLabel("—")
             lbl_v.setObjectName("metric_tile_value")
-            lbl_v.setFont(QFont("Consolas", 16, QFont.Bold))
-            lbl_v.setStyleSheet("color: #ffffff; font-weight: 800; font-size: 18px; background: transparent;")
+            if key == "relay_heater_status":
+                lbl_t.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                lbl_v.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                lbl_v.setFont(QFont("Segoe UI", 10, QFont.Bold))
+                lbl_v.setStyleSheet("color: #ffffff; font-weight: 700; font-size: 12px; background: transparent;")
+                tile_card.setCursor(Qt.PointingHandCursor)
+                tile_card.mousePressEvent = self._on_relay_tile_clicked
+            else:
+                lbl_v.setFont(QFont("Consolas", 16, QFont.Bold))
+                lbl_v.setStyleSheet("color: #ffffff; font-weight: 800; font-size: 18px; background: transparent;")
 
             tl.addWidget(lbl_t)
             tl.addWidget(lbl_v)
@@ -1010,26 +1091,26 @@ class MyApp(QWidget):
         main_layout = QHBoxLayout()
         main_layout.setSpacing(4)
 
-        # ================= Control Sidebar (Compact Scrollable 225px) =================
+        # ================= Control Sidebar (Scrollable 265px) =================
         sidebar_frame = QFrame()
         sidebar_frame.setObjectName("sidebar_frame")
-        sidebar_frame.setFixedWidth(225)
+        sidebar_frame.setFixedWidth(265)
         sidebar_outer_layout = QVBoxLayout(sidebar_frame)
         sidebar_outer_layout.setContentsMargins(0, 0, 0, 0)
         sidebar_outer_layout.setSpacing(0)
 
-        sidebar_scroll = QScrollArea()
-        sidebar_scroll.setObjectName("sidebar_scroll")
-        sidebar_scroll.setWidgetResizable(True)
-        sidebar_scroll.setFrameShape(QFrame.NoFrame)
-        sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        sidebar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.sidebar_scroll = QScrollArea()
+        self.sidebar_scroll.setObjectName("sidebar_scroll")
+        self.sidebar_scroll.setWidgetResizable(True)
+        self.sidebar_scroll.setFrameShape(QFrame.NoFrame)
+        self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.sidebar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
         sidebar_content = QWidget()
         sidebar_content.setObjectName("sidebar_content")
         sidebar_layout = QVBoxLayout(sidebar_content)
         sidebar_layout.setAlignment(Qt.AlignTop)
-        sidebar_layout.setContentsMargins(6, 6, 6, 6)
+        sidebar_layout.setContentsMargins(8, 6, 8, 6)
         sidebar_layout.setSpacing(5)
 
         self.lbl_status_badge = QLabel("IDLE")
@@ -1040,10 +1121,8 @@ class MyApp(QWidget):
         lbl_proc = QLabel("Procedure:")
         lbl_proc.setObjectName("muted_label")
         sidebar_layout.addWidget(lbl_proc)
-        sidebar_layout.addWidget(lbl_proc)
 
         self.combo_box = QComboBox(self)
-        self.combo_box.wheelEvent = lambda event: None
         self._populate_state_combo()
         self.combo_box.currentIndexChanged.connect(self.on_combo_changed)
         sidebar_layout.addWidget(self.combo_box)
@@ -1418,7 +1497,7 @@ class MyApp(QWidget):
         grid_reg.setSpacing(3)
         grid_reg.setContentsMargins(0, 0, 0, 0)
 
-        tip_reg = "Target temperature for closed-loop Lake Shore 370 PID regulation (relay set to CONTROL).\nDefault: 50.0 mK."
+        tip_reg = "Target temperature for closed-loop Lake Shore 370 PID regulation in RAMP mode (controlling magnet field).\nDefault: 50.0 mK."
         lbl_reg = QLabel("Regulate (mK):")
         lbl_reg.setFont(QFont("Segoe UI", 8))
         lbl_reg.setToolTip(tip_reg)
@@ -1442,13 +1521,21 @@ class MyApp(QWidget):
 
         grid_reg.addWidget(lbl_reg, 0, 0)
         grid_reg.addWidget(self.spin_reg_temp, 0, 1)
+
+        self.btn_regulate = QPushButton("Regulate")
+        self.btn_regulate.setObjectName("btn_regulate")
+        self.btn_regulate.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        self.btn_regulate.setCursor(Qt.PointingHandCursor)
+        self.btn_regulate.setToolTip("Engage or live-update closed-loop temperature regulation at the target setpoint.")
+        self.btn_regulate.clicked.connect(self.start_or_update_regulation)
+        grid_reg.addWidget(self.btn_regulate, 1, 0, 1, 2)
         adr_card_layout.addLayout(grid_reg)
 
-        # Action Buttons Row: [Update] and [Reset Recipe Defaults]
+        # Action Buttons Row: [Update Recipe] and [Reset Recipe Defaults]
         btn_action_row = QHBoxLayout()
         btn_action_row.setSpacing(4)
 
-        self.btn_update_params = QPushButton("Update")
+        self.btn_update_params = QPushButton("Update Recipe")
         self.btn_update_params.setObjectName("btn_update_params")
         self.btn_update_params.setFont(QFont("Segoe UI", 8, QFont.Bold))
         self.btn_update_params.setCursor(Qt.PointingHandCursor)
@@ -1471,8 +1558,11 @@ class MyApp(QWidget):
         self.adr_params_box.setVisible(self.expert_mode)
         self.sep_adr.setVisible(self.expert_mode)
 
-        sidebar_scroll.setWidget(sidebar_content)
-        sidebar_outer_layout.addWidget(sidebar_scroll)
+        self.sidebar_scroll.setWidget(sidebar_content)
+        sidebar_outer_layout.addWidget(self.sidebar_scroll)
+
+        # Forward mouse wheel events on all sidebar inputs directly to sidebar_scroll
+        self._sidebar_wheel_forwarder = forward_child_wheel_events(self.sidebar_scroll, sidebar_content)
 
         main_layout.addWidget(sidebar_frame)
 
@@ -1574,6 +1664,15 @@ class MyApp(QWidget):
 
         self.text_output = QTextEdit(self)
         self.text_output.setReadOnly(False)
+        scripting_layout.addWidget(self.text_output)
+        self.scripting_tab.setLayout(scripting_layout)
+
+        # --- 3. Channels Tab (Aliases) ---
+        self.settings_tab = QWidget()
+        settings_layout = QVBoxLayout()
+        settings_layout.setContentsMargins(8, 8, 8, 8)
+        settings_layout.setSpacing(6)
+
         settings_top = QHBoxLayout()
         lbl_settings_hdr = QLabel("Channel Aliases")
         lbl_settings_hdr.setObjectName("section_header")
@@ -1629,16 +1728,6 @@ class MyApp(QWidget):
         db_layout.setContentsMargins(8, 8, 8, 8)
         db_layout.setSpacing(6)
 
-        scroll_area.setWidget(scroll_content)
-        settings_layout.addWidget(scroll_area)
-        self.settings_tab.setLayout(settings_layout)
-
-        # --- 4. History Tab (Database Explorer) ---
-        self.db_tab = QWidget()
-        db_layout = QVBoxLayout()
-        db_layout.setContentsMargins(8, 8, 8, 8)
-        db_layout.setSpacing(6)
-
         db_top_bar = QHBoxLayout()
         lbl_db_hdr = QLabel("Daily Logs History")
         lbl_db_hdr.setObjectName("section_header")
@@ -1679,6 +1768,7 @@ class MyApp(QWidget):
         self.main_tabs.addTab(self.settings_tab, "Channels")
         self.main_tabs.addTab(self.db_tab, "History")
         self.main_tabs.addTab(self.utils_tab, "Utils")
+        self.main_tabs.currentChanged.connect(self._on_main_tab_changed)
 
         main_layout.addWidget(self.main_tabs, stretch=1)
         outer_layout.addLayout(main_layout, stretch=1)
@@ -1867,10 +1957,15 @@ class MyApp(QWidget):
             self.btn_snapshot.setStyleSheet("background-color: #ffffff; color: #475569; border: 1px solid #cbd5e1; font-weight: 500; padding: 4px 10px; border-radius: 4px;")
             if hasattr(self, "adr_params_box"):
                 self.adr_params_box.setStyleSheet("QFrame#adr_params_box { background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; }")
+            if hasattr(self, "btn_regulate"):
+                self.btn_regulate.setStyleSheet(
+                    "QPushButton#btn_regulate { background-color: #0284c7; color: #ffffff; border: 1px solid #0369a1; font-weight: 700; border-radius: 4px; padding: 4px 8px; }"
+                    "QPushButton#btn_regulate:hover { background-color: #0369a1; }"
+                )
             if hasattr(self, "btn_update_params"):
                 self.btn_update_params.setStyleSheet(
-                    "QPushButton#btn_update_params { background-color: #0284c7; color: #ffffff; border: 1px solid #0369a1; font-weight: 700; border-radius: 4px; padding: 4px 8px; }"
-                    "QPushButton#btn_update_params:hover { background-color: #0369a1; }"
+                    "QPushButton#btn_update_params { background-color: #475569; color: #ffffff; border: 1px solid #334155; font-weight: 600; border-radius: 4px; padding: 4px 8px; }"
+                    "QPushButton#btn_update_params:hover { background-color: #334155; }"
                 )
         else:
             self.btn_theme_toggle.setText("Light")
@@ -1884,10 +1979,15 @@ class MyApp(QWidget):
             self.btn_snapshot.setStyleSheet("background-color: #1e293b; color: #cbd5e1; border: 1px solid #334155; font-weight: 500; padding: 4px 10px; border-radius: 4px;")
             if hasattr(self, "adr_params_box"):
                 self.adr_params_box.setStyleSheet("QFrame#adr_params_box { background-color: #0f172a; border: 1px solid #1e293b; border-radius: 6px; }")
+            if hasattr(self, "btn_regulate"):
+                self.btn_regulate.setStyleSheet(
+                    "QPushButton#btn_regulate { background-color: #0284c7; color: #ffffff; border: 1px solid #38bdf8; font-weight: 700; border-radius: 4px; padding: 4px 8px; }"
+                    "QPushButton#btn_regulate:hover { background-color: #0ea5e9; }"
+                )
             if hasattr(self, "btn_update_params"):
                 self.btn_update_params.setStyleSheet(
-                    "QPushButton#btn_update_params { background-color: #0284c7; color: #ffffff; border: 1px solid #38bdf8; font-weight: 700; border-radius: 4px; padding: 4px 8px; }"
-                    "QPushButton#btn_update_params:hover { background-color: #0ea5e9; }"
+                    "QPushButton#btn_update_params { background-color: #334155; color: #f8fafc; border: 1px solid #475569; font-weight: 600; border-radius: 4px; padding: 4px 8px; }"
+                    "QPushButton#btn_update_params:hover { background-color: #475569; }"
                 )
 
         # Digital metric tiles styling — filled solid with plot line colors and white text
@@ -1898,7 +1998,10 @@ class MyApp(QWidget):
             )
             if "lbl_t" in spec:
                 spec["lbl_t"].setStyleSheet("color: rgba(255, 255, 255, 0.92); font-weight: 700; font-size: 11px; background: transparent;")
-            spec["val"].setStyleSheet("color: #ffffff; font-weight: 800; font-size: 18px; background: transparent;")
+            if key == "relay_heater_status":
+                spec["val"].setStyleSheet("color: #ffffff; font-weight: 700; font-size: 12px; background: transparent;")
+            else:
+                spec["val"].setStyleSheet("color: #ffffff; font-weight: 800; font-size: 18px; background: transparent;")
 
         self._style_subkelvin_btn()
         self._style_mode_btn()
@@ -2087,6 +2190,15 @@ class MyApp(QWidget):
             CHANNEL_ALIASES[key] = inp.text().strip() or key
         save_aliases()
         self.update_plot()
+
+    def reset_default_aliases(self):
+        CHANNEL_ALIASES.clear()
+        CHANNEL_ALIASES.update(DEFAULT_CHANNEL_ALIASES)
+        if hasattr(self, "alias_inputs"):
+            for key, inp in self.alias_inputs.items():
+                inp.setText(CHANNEL_ALIASES.get(key, key))
+        save_aliases()
+        self.update_plot()
     def _populate_state_combo(self):
         cur_key = self.current_selected_state_key() or IDLE_STATE
         self.combo_box.blockSignals(True)
@@ -2235,6 +2347,15 @@ class MyApp(QWidget):
             self.combo_box.setCurrentIndex(idx)
             self.combo_box.blockSignals(False)
         self.lbl_script_name.setText(f"Active Script: {state_label(IDLE_STATE)}")
+
+    def _on_procedure_error(self, state_name, err_msg):
+        self._set_status_badge("ERROR", "error")
+        idx = self.combo_box.findData(IDLE_STATE)
+        if idx >= 0:
+            self.combo_box.blockSignals(True)
+            self.combo_box.setCurrentIndex(idx)
+            self.combo_box.blockSignals(False)
+        self.lbl_script_name.setText(f"Active Script: {state_label(IDLE_STATE)}")
         mag_I = abs(getattr(self, "_latest_magnet_current", 0.0))
         if mag_I > 0.2:
             self.show_operator_banner(
@@ -2255,7 +2376,194 @@ class MyApp(QWidget):
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(14)
 
-        # 1. Telemetry and Hardware Loop Group
+        # 1. Lake Shore 370 Closed-Loop PID & Temperature Control
+        grp_pid = QGroupBox("Lake Shore 370 Closed-Loop PID and Heater Settings")
+        pid_main_layout = QVBoxLayout(grp_pid)
+        pid_main_layout.setSpacing(10)
+        pid_main_layout.setContentsMargins(12, 14, 12, 12)
+
+        lbl_pid_desc = QLabel(
+            "Configure active closed-loop PID control gains, heater resistance (R), "
+            "setpoint ramping, and excitation range for sub-Kelvin temperature regulation on the FAA stage (Channel 4)."
+        )
+        lbl_pid_desc.setWordWrap(True)
+        lbl_pid_desc.setObjectName("muted_label")
+        pid_main_layout.addWidget(lbl_pid_desc)
+
+        pid_cfg = self.gui_settings.get("pid_config", {})
+
+        # Grid of parameters (3 columns)
+        pid_grid = QGridLayout()
+        pid_grid.setHorizontalSpacing(16)
+        pid_grid.setVerticalSpacing(8)
+
+        # --- Column 1: PID Gains ---
+        lbl_gain_hdr = QLabel("PID Gains")
+        lbl_gain_hdr.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        pid_grid.addWidget(lbl_gain_hdr, 0, 0, 1, 2)
+
+        pid_grid.addWidget(QLabel("Proportional Gain (P):"), 1, 0)
+        self.spin_pid_p = QDoubleSpinBox()
+        self.spin_pid_p.setRange(0.001, 1000.0)
+        self.spin_pid_p.setDecimals(3)
+        self.spin_pid_p.setSingleStep(0.01)
+        self.spin_pid_p.setValue(float(pid_cfg.get("p", 0.05)))
+        self.spin_pid_p.setToolTip("Lake Shore 370 closed loop Proportional gain (gain term). Default: 0.05")
+        pid_grid.addWidget(self.spin_pid_p, 1, 1)
+
+        pid_grid.addWidget(QLabel("Integral Reset (I):"), 2, 0)
+        self.spin_pid_i = QDoubleSpinBox()
+        self.spin_pid_i.setRange(0.1, 1000.0)
+        self.spin_pid_i.setDecimals(1)
+        self.spin_pid_i.setSingleStep(1.0)
+        self.spin_pid_i.setSuffix(" s")
+        self.spin_pid_i.setValue(float(pid_cfg.get("i", 12.0)))
+        self.spin_pid_i.setToolTip("Lake Shore 370 closed loop Integral reset time in seconds. Default: 12.0 s")
+        pid_grid.addWidget(self.spin_pid_i, 2, 1)
+
+        pid_grid.addWidget(QLabel("Derivative Rate (D):"), 3, 0)
+        self.spin_pid_d = QDoubleSpinBox()
+        self.spin_pid_d.setRange(0.0, 200.0)
+        self.spin_pid_d.setDecimals(1)
+        self.spin_pid_d.setSingleStep(1.0)
+        self.spin_pid_d.setSuffix(" s")
+        self.spin_pid_d.setValue(float(pid_cfg.get("d", 0.0)))
+        self.spin_pid_d.setToolTip("Lake Shore 370 closed loop Derivative rate in seconds. Default: 0.0 s")
+        pid_grid.addWidget(self.spin_pid_d, 3, 1)
+
+        # --- Column 2: Heater & Loop Setup (CSET) ---
+        lbl_cset_hdr = QLabel("Heater Setup (CSET)")
+        lbl_cset_hdr.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        pid_grid.addWidget(lbl_cset_hdr, 0, 2, 1, 2)
+
+        pid_grid.addWidget(QLabel("Heater Resistance (R):"), 1, 2)
+        self.spin_pid_r = QDoubleSpinBox()
+        self.spin_pid_r.setRange(1.0, 2000.0)
+        self.spin_pid_r.setDecimals(1)
+        self.spin_pid_r.setSingleStep(1.0)
+        self.spin_pid_r.setSuffix(" Ω")
+        self.spin_pid_r.setValue(float(pid_cfg.get("heater_resistance", 100.0)))
+        self.spin_pid_r.setToolTip("Stage control resistor resistance in Ohms (CSET resistance parameter). Default: 100.0 Ω")
+        pid_grid.addWidget(self.spin_pid_r, 1, 3)
+
+        pid_grid.addWidget(QLabel("Control Channel:"), 2, 2)
+        self.spin_pid_channel = QSpinBox()
+        self.spin_pid_channel.setRange(1, 16)
+        self.spin_pid_channel.setValue(int(pid_cfg.get("channel", 4)))
+        self.spin_pid_channel.setToolTip("Sensor channel used for closed-loop control. Channel 4 = FAA stage.")
+        pid_grid.addWidget(self.spin_pid_channel, 2, 3)
+
+        pid_grid.addWidget(QLabel("Current Limit:"), 3, 2)
+        self.combo_pid_limit = QComboBox()
+        limits = [
+            ("1: 31.6 µA", 1),
+            ("2: 100 µA", 2),
+            ("3: 316 µA", 3),
+            ("4: 1 mA", 4),
+            ("5: 3.16 mA", 5),
+            ("6: 10 mA", 6),
+            ("7: 31.6 mA", 7),
+            ("8: 100 mA", 8),
+        ]
+        for txt, val in limits:
+            self.combo_pid_limit.addItem(txt, val)
+        cur_lim = int(pid_cfg.get("heater_limit", 4))
+        idx_lim = self.combo_pid_limit.findData(cur_lim)
+        if idx_lim >= 0:
+            self.combo_pid_limit.setCurrentIndex(idx_lim)
+        self.combo_pid_limit.setToolTip("Maximum heater output current limit setting (CSET max range code).")
+        pid_grid.addWidget(self.combo_pid_limit, 3, 3)
+
+        # --- Column 3: Setpoint Ramping & Excitation Range ---
+        lbl_ramp_hdr = QLabel("Setpoint Ramping and Range")
+        lbl_ramp_hdr.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        pid_grid.addWidget(lbl_ramp_hdr, 0, 4, 1, 2)
+
+        self.chk_pid_ramp_enable = QCheckBox("Enable Setpoint Ramping")
+        self.chk_pid_ramp_enable.setChecked(bool(pid_cfg.get("ramp_enable", False)))
+        self.chk_pid_ramp_enable.setToolTip("Enable or disable continuous setpoint ramping on the Lake Shore 370 (RAMP command).")
+        pid_grid.addWidget(self.chk_pid_ramp_enable, 1, 4, 1, 2)
+
+        pid_grid.addWidget(QLabel("Ramp Speed / Rate:"), 2, 4)
+        self.spin_pid_ramp_rate = QDoubleSpinBox()
+        self.spin_pid_ramp_rate.setRange(0.1, 5000.0)
+        self.spin_pid_ramp_rate.setDecimals(1)
+        self.spin_pid_ramp_rate.setSingleStep(1.0)
+        self.spin_pid_ramp_rate.setSuffix(" mK/min")
+        self.spin_pid_ramp_rate.setValue(float(pid_cfg.get("ramp_rate_mk_min", 10.0)))
+        self.spin_pid_ramp_rate.setToolTip("Setpoint ramp rate in mK/min (e.g. 10.0 mK/min = 0.010 K/min on Lake Shore 370 RAMP).")
+        pid_grid.addWidget(self.spin_pid_ramp_rate, 2, 5)
+
+        pid_grid.addWidget(QLabel("Excitation Range:"), 3, 4)
+        self.combo_pid_range = QComboBox()
+        self.combo_pid_range.addItems(["off", "31.6uA", "100uA", "316uA", "1mA", "3.16mA", "10mA", "31.6mA", "100mA"])
+        self.combo_pid_range.setCurrentText(str(pid_cfg.get("heater_range", "100uA")))
+        self.combo_pid_range.setToolTip("Lake Shore 370 heater excitation output range (HTRRNG). Default: 100uA.")
+        pid_grid.addWidget(self.combo_pid_range, 3, 5)
+
+        pid_main_layout.addLayout(pid_grid)
+
+        # Action Buttons Row
+        pid_btns_row = QHBoxLayout()
+        pid_btns_row.setSpacing(8)
+
+        self.btn_apply_pid = QPushButton("Update and Apply Settings")
+        self.btn_apply_pid.setObjectName("btn_apply_pid")
+        self.btn_apply_pid.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        self.btn_apply_pid.setCursor(Qt.PointingHandCursor)
+        self.btn_apply_pid.setToolTip("Write PID gains, CSET (R value), RAMP rate, and heater range directly to the Lake Shore 370 and save to settings.")
+        self.btn_apply_pid.clicked.connect(self.apply_pid_settings)
+        pid_btns_row.addWidget(self.btn_apply_pid)
+
+        self.btn_read_pid = QPushButton("Read from Instrument")
+        self.btn_read_pid.setFont(QFont("Segoe UI", 9))
+        self.btn_read_pid.setCursor(Qt.PointingHandCursor)
+        self.btn_read_pid.setToolTip("Query live registers (PID?, CSET?, RAMP?, HTRRNG?) directly from Lake Shore 370 and update controls.")
+        self.btn_read_pid.clicked.connect(self.read_pid_from_instrument)
+        pid_btns_row.addWidget(self.btn_read_pid)
+
+        self.btn_reset_pid_defaults = QPushButton("Reset Recipe Defaults")
+        self.btn_reset_pid_defaults.setFont(QFont("Segoe UI", 9))
+        self.btn_reset_pid_defaults.setCursor(Qt.PointingHandCursor)
+        self.btn_reset_pid_defaults.setToolTip("Reset controls to recommended sub-Kelvin FAA regulation values: P=0.05, I=12s, D=0s, R=100Ω, 100µA range.")
+        self.btn_reset_pid_defaults.clicked.connect(self.reset_pid_defaults)
+        pid_btns_row.addWidget(self.btn_reset_pid_defaults)
+
+        pid_btns_row.addStretch()
+        pid_main_layout.addLayout(pid_btns_row)
+
+        # Latching Relay Control Row
+        relay_ctrl_row = QHBoxLayout()
+        relay_ctrl_row.setSpacing(8)
+        lbl_r_hdr = QLabel("Latching Relay (Pins 16/18):")
+        lbl_r_hdr.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        relay_ctrl_row.addWidget(lbl_r_hdr)
+
+        self.btn_relay_ctrl_mode = QPushButton("Set to CONTROL (Pin 18)")
+        self.btn_relay_ctrl_mode.setCursor(Qt.PointingHandCursor)
+        self.btn_relay_ctrl_mode.setToolTip("Pulse CIO2 (Pin 18) for 1.0s to switch latching relay to CONTROL mode (FAA stage heater).")
+        self.btn_relay_ctrl_mode.clicked.connect(lambda: self._switch_relay_mode_direct("CONTROL"))
+        relay_ctrl_row.addWidget(self.btn_relay_ctrl_mode)
+
+        self.btn_relay_ramp_mode = QPushButton("Set to RAMP (Pin 16)")
+        self.btn_relay_ramp_mode.setCursor(Qt.PointingHandCursor)
+        self.btn_relay_ramp_mode.setToolTip("Pulse CIO0 (Pin 16) for 1.0s to switch latching relay to RAMP mode (magnet power supply).")
+        self.btn_relay_ramp_mode.clicked.connect(lambda: self._switch_relay_mode_direct("RAMP"))
+        relay_ctrl_row.addWidget(self.btn_relay_ramp_mode)
+
+        self.lbl_relay_mode_status = QLabel("State: —")
+        self.lbl_relay_mode_status.setObjectName("muted_label")
+        relay_ctrl_row.addWidget(self.lbl_relay_mode_status)
+        relay_ctrl_row.addStretch()
+        pid_main_layout.addLayout(relay_ctrl_row)
+
+        self.lbl_pid_status = QLabel("Ready")
+        self.lbl_pid_status.setObjectName("muted_label")
+        pid_main_layout.addWidget(self.lbl_pid_status)
+
+        layout.addWidget(grp_pid)
+
+        # 2. Telemetry and Hardware Loop Group
         grp_telemetry = QGroupBox("Hardware Telemetry and Logging")
         telemetry_form = QFormLayout(grp_telemetry)
         telemetry_form.setLabelAlignment(Qt.AlignLeft)
@@ -2365,10 +2673,176 @@ class MyApp(QWidget):
         layout.addStretch()
 
         scroll.setWidget(content)
+        self._utils_wheel_forwarder = forward_child_wheel_events(scroll, content)
         outer = QVBoxLayout(tab)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
         return tab
+
+    def _handle_pid_status(self, msg):
+        """Thread-safe handler for PID status message updates."""
+        if hasattr(self, "lbl_pid_status") and self.lbl_pid_status:
+            self.lbl_pid_status.setText(msg)
+        if msg.startswith("✓ Applied") and hasattr(self, "btn_apply_pid"):
+            orig_text = "Update and Apply Settings"
+            self.btn_apply_pid.setText("✓ Settings Applied!")
+            self.btn_apply_pid.setStyleSheet("background-color: #16a34a; color: #ffffff; font-weight: bold; border-radius: 4px; padding: 6px 12px;")
+            QTimer.singleShot(1500, lambda: self._restore_apply_pid_btn(orig_text))
+
+    def _restore_apply_pid_btn(self, orig_text):
+        if hasattr(self, "btn_apply_pid"):
+            self.btn_apply_pid.setText(orig_text)
+            self.btn_apply_pid.setStyleSheet("")
+
+    def _handle_pid_read(self, data):
+        """Thread-safe handler for populating UI controls with readback data."""
+        pid_parts = data.get("pid_parts", [])
+        cset_parts = data.get("cset_parts", [])
+        ramp_parts = data.get("ramp_parts", [])
+        range_str = data.get("range_str", "100uA")
+        pid_raw = data.get("pid_raw", "")
+
+        if len(pid_parts) >= 3:
+            self.spin_pid_p.setValue(pid_parts[0])
+            self.spin_pid_i.setValue(pid_parts[1])
+            self.spin_pid_d.setValue(pid_parts[2])
+        if len(cset_parts) >= 7:
+            try:
+                self.spin_pid_channel.setValue(int(cset_parts[0]))
+                lim = int(cset_parts[5])
+                idx = self.combo_pid_limit.findData(lim)
+                if idx >= 0:
+                    self.combo_pid_limit.setCurrentIndex(idx)
+                self.spin_pid_r.setValue(float(cset_parts[6]))
+            except Exception:
+                pass
+        if len(ramp_parts) >= 2:
+            try:
+                self.chk_pid_ramp_enable.setChecked(ramp_parts[0] == "1")
+                self.spin_pid_ramp_rate.setValue(float(ramp_parts[1]) * 1000.0)
+            except Exception:
+                pass
+        self.combo_pid_range.setCurrentText(range_str)
+        ramp_txt = f"Ramp {'ON (' + str(round(float(ramp_parts[1])*1000.0, 1)) + ' mK/min)' if (len(ramp_parts) >= 2 and ramp_parts[0] == '1') else 'OFF'}"
+        r_val = cset_parts[6] if len(cset_parts) >= 7 else "100"
+        self.lbl_pid_status.setText(f"✓ Read from hardware: PID ({pid_raw}) | R={r_val}Ω | {ramp_txt} | Range={range_str}")
+
+    def apply_pid_settings(self):
+        """Write user-configured PID, CSET (resistance R), RAMP, and heater range to Lake Shore 370."""
+        p = float(self.spin_pid_p.value())
+        i = float(self.spin_pid_i.value())
+        d = float(self.spin_pid_d.value())
+        r = float(self.spin_pid_r.value())
+        ch = int(self.spin_pid_channel.value())
+        limit = int(self.combo_pid_limit.currentData() if self.combo_pid_limit.currentData() is not None else 4)
+        htr_range = str(self.combo_pid_range.currentText())
+        ramp_en = 1 if self.chk_pid_ramp_enable.isChecked() else 0
+        ramp_rate_mk = float(self.spin_pid_ramp_rate.value())
+        ramp_rate_k = ramp_rate_mk / 1000.0
+
+        # Save to gui_settings
+        self.gui_settings["pid_config"] = {
+            "p": p,
+            "i": i,
+            "d": d,
+            "heater_resistance": r,
+            "channel": ch,
+            "heater_limit": limit,
+            "heater_range": htr_range,
+            "ramp_enable": bool(ramp_en),
+            "ramp_rate_mk_min": ramp_rate_mk,
+        }
+        save_gui_settings(self.gui_settings)
+
+        self.lbl_pid_status.setText("Writing parameters to Lake Shore 370...")
+
+        def _do_apply():
+            try:
+                st = getattr(self.world, "station", None) if hasattr(self, "world") else None
+                ls = getattr(st, "ls370", None) if st else None
+                rc = getattr(ls, "heater", None) if ls else None
+                if ls:
+                    ls.write(f"CSET {ch}, 1, 1, 1, 1, {limit}, {r:.1f}")
+                    import time
+                    time.sleep(0.15)
+                    ls.write(f"PID {p:.4f}, {i:.1f}, {d:.1f}")
+                    time.sleep(0.15)
+                    ls.write(f"RAMP {ramp_en}, {ramp_rate_k:.4f}")
+                    time.sleep(0.15)
+                    if rc:
+                        try:
+                            rc.range(htr_range)
+                        except Exception:
+                            range_map = {"off": 0, "31.6uA": 1, "100uA": 2, "316uA": 3, "1mA": 4, "3.16mA": 5, "10mA": 6, "31.6mA": 7, "100mA": 8}
+                            if htr_range in range_map:
+                                ls.write(f"HTRRNG {range_map[htr_range]}")
+                    ramp_desc = f"Ramp On ({ramp_rate_mk:.1f} mK/min)" if ramp_en else "Ramp Off"
+                    msg = f"✓ Applied to Lake Shore 370: P={p}, I={i:.1f}s, D={d:.1f}s | R={r:.1f}Ω | Range={htr_range} | {ramp_desc}"
+                else:
+                    msg = "✓ Settings saved to profile (Instrument offline)"
+                self.sig_pid_status.emit(msg)
+            except Exception as ex:
+                err_msg = f"⚠️ Error applying settings: {ex}"
+                self.sig_pid_status.emit(err_msg)
+
+        threading.Thread(target=_do_apply, daemon=True).start()
+
+    def read_pid_from_instrument(self):
+        """Query registers directly from the Lake Shore 370 and populate the UI controls."""
+        self.lbl_pid_status.setText("Querying Lake Shore 370 registers (PID?, CSET?, RAMP?, HTRRNG?)...")
+
+        def _do_read():
+            try:
+                st = getattr(self.world, "station", None) if hasattr(self, "world") else None
+                ls = getattr(st, "ls370", None) if st else None
+                if not ls:
+                    self.sig_pid_status.emit("Lake Shore 370 instrument not available.")
+                    return
+
+                pid_raw = ls.ask("PID?").strip()
+                import time
+                time.sleep(0.15)
+                cset_raw = ls.ask("CSET?").strip()
+                time.sleep(0.15)
+                ramp_raw = ls.ask("RAMP?").strip()
+                time.sleep(0.15)
+                htrrng_raw = ls.ask("HTRRNG?").strip()
+
+                pid_parts = [float(x.strip()) for x in pid_raw.split(",") if x.strip()]
+                cset_parts = [x.strip() for x in cset_raw.split(",") if x.strip()]
+                ramp_parts = [x.strip() for x in ramp_raw.split(",") if x.strip()]
+                range_code = int(htrrng_raw) if htrrng_raw.isdigit() else 2
+
+                inv_ranges = {0: "off", 1: "31.6uA", 2: "100uA", 3: "316uA", 4: "1mA", 5: "3.16mA", 6: "10mA", 7: "31.6mA", 8: "100mA"}
+                range_str = inv_ranges.get(range_code, "100uA")
+
+                self.sig_pid_read.emit({
+                    "pid_parts": pid_parts,
+                    "cset_parts": cset_parts,
+                    "ramp_parts": ramp_parts,
+                    "range_str": range_str,
+                    "pid_raw": pid_raw,
+                })
+            except Exception as e:
+                err = f"⚠️ Could not read from Lake Shore 370: {e}"
+                self.sig_pid_status.emit(err)
+
+        threading.Thread(target=_do_read, daemon=True).start()
+
+    def reset_pid_defaults(self):
+        """Restore recommended sub-Kelvin FAA regulation settings."""
+        self.spin_pid_p.setValue(0.05)
+        self.spin_pid_i.setValue(12.0)
+        self.spin_pid_d.setValue(0.0)
+        self.spin_pid_r.setValue(100.0)
+        self.spin_pid_channel.setValue(4)
+        idx = self.combo_pid_limit.findData(4)
+        if idx >= 0:
+            self.combo_pid_limit.setCurrentIndex(idx)
+        self.combo_pid_range.setCurrentText("100uA")
+        self.chk_pid_ramp_enable.setChecked(False)
+        self.spin_pid_ramp_rate.setValue(10.0)
+        self.lbl_pid_status.setText("Reset to recommended FAA sub-Kelvin defaults (P=0.05, I=12s, R=100Ω). Click 'Update & Apply Settings' to write to instrument.")
 
     def _on_log_interval_changed(self, val):
         self.world.target_tick_rate_s = float(val)
@@ -2713,6 +3187,101 @@ Categories=Science;Utility;
         if changed:
             self._update_heatswitch_ui()
 
+    def _switch_relay_mode_direct(self, mode: str):
+        """Directly pulse latching relay to CONTROL (Pin 18) or RAMP (Pin 16) with safety checks."""
+        st = getattr(self.world, "station", None)
+        lj = getattr(st, "labjack", None) if st else None
+        if not lj or not hasattr(lj, "relay"):
+            QMessageBox.information(self, "Relay Control", "LabJack relay instrument is not available.")
+            return
+
+        # Safety check: do not switch if magnet is energized (> 0.5 A)
+        cur_mag_i = abs(getattr(self, "_latest_magnet_current", 0.0))
+        if cur_mag_i > 0.5:
+            QMessageBox.warning(
+                self,
+                "Relay Safety Lockout",
+                f"Cannot switch relay while magnet current is high ({cur_mag_i:.3f} A).\n\n"
+                f"For safety, ramp down the magnet current to 0.0 A before switching relay modes."
+            )
+            return
+
+        def _do_switch():
+            try:
+                print(f"[Relay Control] Pulsing LabJack latching relay to {mode}...")
+                lj.relay(mode)
+                print(f"[Relay Control] Finished pulsing latching relay to {mode}.")
+                self.sig_pid_status.emit(f"✓ Relay switched to {mode} mode")
+                from daily_logger import save_hardware_state
+                cur_state = self.current_selected_state_key() or IDLE_STATE
+                save_hardware_state(
+                    magnet_current=abs(getattr(self, "_latest_magnet_current", 0.0)),
+                    he3_pressure=getattr(self, "_latest_he3_pressure", 0.0),
+                    active_procedure=cur_state,
+                    phase_name=getattr(self.world, "current_phase", "Holding steady"),
+                    heatswitches=self._hs_states,
+                    relay=mode
+                )
+            except Exception as ex:
+                print(f"[Relay Control] Error switching relay to {mode}: {ex}")
+                self.sig_pid_status.emit(f"⚠️ Error switching relay: {ex}")
+
+        threading.Thread(target=_do_switch, daemon=True).start()
+
+    def _on_relay_tile_clicked(self, event=None):
+        """Allow user to toggle or switch latching relay between CONTROL and RAMP with confirmation."""
+        st = getattr(self.world, "station", None)
+        lj = getattr(st, "labjack", None) if st else None
+        if not lj or not hasattr(lj, "relay"):
+            QMessageBox.information(self, "Relay Control", "LabJack relay instrument is not available.")
+            return
+
+        # Safety check: do not switch if magnet is energized (> 0.5 A)
+        cur_mag_i = abs(getattr(self, "_latest_magnet_current", 0.0))
+        if cur_mag_i > 0.5:
+            QMessageBox.warning(
+                self,
+                "Relay Safety Lockout",
+                f"Cannot switch relay while magnet current is high ({cur_mag_i:.3f} A).\n\n"
+                f"For safety, ramp down the magnet current to 0.0 A before switching relay modes."
+            )
+            return
+
+        cur_rel = "UNKNOWN"
+        try:
+            cur_rel = str(lj.relay.cache.get() or "UNKNOWN").upper()
+        except Exception:
+            pass
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Switch Latching Relay Mode")
+        msg_box.setIcon(QMessageBox.Question)
+        msg_box.setText(
+            f"<h3>Latching Relay Hardware Mode</h3>"
+            f"The latching relay is currently set to: <b>{cur_rel}</b>.<br><br>"
+            f"Select which hardware latching coil to pulse:<br><br>"
+            f"• <b>CONTROL (Pin 18 / CIO2)</b>: Routes Lake Shore 370 heater output to the FAA stage heater for sub-Kelvin temperature regulation.<br>"
+            f"• <b>RAMP (Pin 16 / CIO0)</b>: Routes Lake Shore 370 output to Kepco power supply programming input for magnet ramping.<br>"
+        )
+        btn_control = msg_box.addButton("Switch to CONTROL", QMessageBox.ActionRole)
+        btn_ramp = msg_box.addButton("Switch to RAMP", QMessageBox.ActionRole)
+        btn_cancel = msg_box.addButton("Cancel", QMessageBox.RejectRole)
+        if cur_rel == "CONTROL":
+            msg_box.setDefaultButton(btn_ramp)
+        else:
+            msg_box.setDefaultButton(btn_control)
+
+        msg_box.exec_()
+        clicked = msg_box.clickedButton()
+        if clicked == btn_control:
+            target_rel = "CONTROL"
+        elif clicked == btn_ramp:
+            target_rel = "RAMP"
+        else:
+            return
+
+        self._switch_relay_mode_direct(target_rel)
+
     # ------------- State Control ---------------
     def _check_external_commands(self):
         cmd_file = Path("/tmp/2pac_gui_command.txt")
@@ -2815,13 +3384,25 @@ Categories=Science;Utility;
                     temp_str = cmd.split("regulate:")[1].strip()
                     try:
                         self.spin_reg_temp.setValue(float(temp_str))
-                        self.hot_update_params(bypass_popup=True)
+                        self.start_or_update_regulation()
                     except Exception as e:
                         print(f"Error executing external regulate command: {e}")
-                elif cmd in ("update", "update_params", "hot_update", "regulate"):
+                elif cmd == "regulate":
+                    self.start_or_update_regulation()
+                elif cmd in ("update", "update_params", "hot_update"):
                     self.hot_update_params(bypass_popup=True)
                 elif cmd == "reset_adr_params":
                     self.reset_default_adr_params()
+                elif cmd.startswith("set_relay:"):
+                    rel_target = cmd.split("set_relay:")[1].strip().upper()
+                    if hasattr(self.world, "station") and hasattr(self.world.station, "labjack"):
+                        self.world.station.labjack.relay(rel_target)
+                elif cmd.startswith("exec:"):
+                    py_code = cmd.split("exec:", 1)[1].strip()
+                    try:
+                        exec(py_code, {"self": self, "world": self.world, "st": getattr(self.world, "station", None)})
+                    except Exception as exc:
+                        print(f"[EXEC ERROR] {exc}")
                 elif cmd.startswith("set_adr_param:"):
                     parts = cmd.split("set_adr_param:")[1].strip().split(":")
                     if len(parts) == 2:
@@ -2887,6 +3468,10 @@ Categories=Science;Utility;
         if hasattr(self, "world") and hasattr(self.world, "adr_config"):
             self.gui_settings["adr_config"] = dict(self.world.adr_config)
             save_gui_settings(self.gui_settings)
+        # If actively regulating, push setpoint change to hardware immediately
+        is_reg = (self.data_thread and self.data_thread.state and self.data_thread.state.name() == "regulate_temperature")
+        if is_reg:
+            self.hot_update_params(bypass_popup=True)
 
     def _sync_adr_config_to_world(self):
         """Synchronize UI spinbox values into world.adr_config."""
@@ -2962,13 +3547,36 @@ Categories=Science;Utility;
             try:
                 if hasattr(self, "world") and hasattr(self.world, "station") and self.world.station:
                     st = self.world.station
-                    # 1. Hot update LS370 heater setpoint ONLY if actively in regulate_temperature state
+                    # 1. Hot update LS370 heater setpoint if actively in regulate_temperature state OR if relay is in CONTROL mode
                     # Note: We do NOT query rc.mode() over serial to avoid serial port collisions with telemetry update()
                     if hasattr(st, "ls370") and st.ls370:
                         rc = st.ls370.heater
                         try:
-                            if self.data_thread and self.data_thread.state and self.data_thread.state.name() == "regulate_temperature":
-                                rc.setpoint(target_k)
+                            is_reg = (self.data_thread and self.data_thread.state and self.data_thread.state.name() == "regulate_temperature")
+                            is_closed = False
+                            try:
+                                is_closed = (rc.mode.cache.get() == "closed")
+                            except Exception:
+                                pass
+                            if is_reg or is_closed:
+                                if not is_closed:
+                                    try:
+                                        st.ls370.write("CSET 4, 1, 1, 1, 1, 4, 100")
+                                        st.ls370.write("PID 0.05, 12, 0")
+                                        st.ls370.write("SCAN 4, 0")
+                                    except Exception as ce:
+                                        print(f"[HOT UPDATE] CSET/PID write notice: {ce}")
+                                    rc.mode("closed")
+                                    import time
+                                    time.sleep(0.3)
+                                # Write SETP directly to hardware to guarantee front panel updates
+                                try:
+                                    st.ls370.write(f"SETP {target_k:.4f}")
+                                except Exception as we:
+                                    print(f"[HOT UPDATE] Direct SETP write warning: {we}")
+                                if hasattr(rc, "setpoint") and hasattr(rc.setpoint, "cache"):
+                                    rc.setpoint.cache.set(target_k)
+                                rc.range("100uA")
                                 print(f"[HOT UPDATE] LS370 closed-loop setpoint hot-updated to {target_k:.4f} K ({disp_target})")
                         except Exception as e:
                             print(f"[HOT UPDATE] LS370 setpoint update error: {e}")
@@ -2998,18 +3606,98 @@ Categories=Science;Utility;
 
     def _restore_update_btn_style(self):
         if hasattr(self, "btn_update_params"):
-            self.btn_update_params.setText("Update")
+            self.btn_update_params.setText("Update Recipe")
             is_light = (self.theme == "light")
             if is_light:
                 self.btn_update_params.setStyleSheet(
-                    "QPushButton#btn_update_params { background-color: #0284c7; color: #ffffff; border: 1px solid #0369a1; font-weight: 700; border-radius: 4px; padding: 4px 8px; }"
-                    "QPushButton#btn_update_params:hover { background-color: #0369a1; }"
+                    "QPushButton#btn_update_params { background-color: #475569; color: #ffffff; border: 1px solid #334155; font-weight: 600; border-radius: 4px; padding: 4px 8px; }"
+                    "QPushButton#btn_update_params:hover { background-color: #334155; }"
                 )
             else:
                 self.btn_update_params.setStyleSheet(
-                    "QPushButton#btn_update_params { background-color: #0284c7; color: #ffffff; border: 1px solid #38bdf8; font-weight: 700; border-radius: 4px; padding: 4px 8px; }"
-                    "QPushButton#btn_update_params:hover { background-color: #0ea5e9; }"
+                    "QPushButton#btn_update_params { background-color: #334155; color: #f8fafc; border: 1px solid #475569; font-weight: 600; border-radius: 4px; padding: 4px 8px; }"
+                    "QPushButton#btn_update_params:hover { background-color: #475569; }"
                 )
+
+    def _restore_regulate_btn_style(self):
+        if hasattr(self, "btn_regulate"):
+            self.btn_regulate.setText("Regulate")
+            is_light = (self.theme == "light")
+            if is_light:
+                self.btn_regulate.setStyleSheet(
+                    "QPushButton#btn_regulate { background-color: #0284c7; color: #ffffff; border: 1px solid #0369a1; font-weight: 700; border-radius: 4px; padding: 4px 8px; }"
+                    "QPushButton#btn_regulate:hover { background-color: #0369a1; }"
+                )
+            else:
+                self.btn_regulate.setStyleSheet(
+                    "QPushButton#btn_regulate { background-color: #0284c7; color: #ffffff; border: 1px solid #38bdf8; font-weight: 700; border-radius: 4px; padding: 4px 8px; }"
+                    "QPushButton#btn_regulate:hover { background-color: #0ea5e9; }"
+                )
+
+    def start_or_update_regulation(self):
+        """
+        Engage or live-update closed-loop temperature regulation at the setpoint in spin_reg_temp.
+        - Synchronizes spin_reg_temp to world.adr_config and saves to gui_settings.json.
+        - If already in regulate_temperature state, hot-updates the LS370 setpoint live.
+        - If not currently in regulate_temperature (e.g. idle in wait_forever), verifies magnet safety
+          and transitions state machine directly to regulate_temperature.
+        """
+        self._sync_adr_config_to_world()
+        if hasattr(self, "world") and hasattr(self.world, "adr_config"):
+            self.gui_settings["adr_config"] = dict(self.world.adr_config)
+            save_gui_settings(self.gui_settings)
+
+        target_mk = float(self.spin_reg_temp.value())
+        target_k = target_mk / 1000.0 if target_mk >= 1.0 else target_mk
+        disp_target = f"{target_mk:.1f} mK" if target_mk < 1000.0 else f"{target_k:.3f} K"
+
+        cur_st_name = ""
+        if hasattr(self, "data_thread") and self.data_thread and self.data_thread.state:
+            cur_st_name = self.data_thread.state.name()
+
+        if cur_st_name == "regulate_temperature":
+            self.hot_update_params(bypass_popup=True)
+            if hasattr(self, "btn_regulate"):
+                self.btn_regulate.setText(f"✓ {disp_target}")
+                self.btn_regulate.setStyleSheet(
+                    "QPushButton#btn_regulate { background-color: #16a34a; color: #ffffff; border: 1px solid #15803d; font-weight: 700; border-radius: 4px; padding: 4px 8px; }"
+                )
+                QTimer.singleShot(1500, self._restore_regulate_btn_style)
+        else:
+            cur_relay = None
+            if hasattr(self, "world") and hasattr(self.world, "station") and hasattr(self.world.station, "labjack"):
+                try:
+                    cur_relay = self.world.station.labjack.relay.cache.get()
+                except Exception:
+                    cur_relay = None
+            mag_I = abs(getattr(self, "_latest_magnet_current", 0.0))
+            if cur_relay != "CONTROL" and mag_I > 0.5:
+                QMessageBox.warning(
+                    self,
+                    "Regulation Blocked",
+                    f"Magnet current is elevated at {mag_I:.3f} A!\n\n"
+                    "Cannot engage temperature regulation while magnet is energized.\n"
+                    "Run 'Ramp Down Magnet' first."
+                )
+                return
+
+            if "regulate_temperature" in self.states_dict:
+                st = self.states_dict["regulate_temperature"]
+                idx = self.combo_box.findData("regulate_temperature")
+                if idx >= 0:
+                    self.combo_box.blockSignals(True)
+                    self.combo_box.setCurrentIndex(idx)
+                    self.combo_box.blockSignals(False)
+                self.data_thread.next_state = st
+                self.data_thread.paused = False
+                self._set_status_badge("RUNNING", "running")
+                self.lbl_script_name.setText(f"Active Script: {state_label('regulate_temperature')}")
+                if hasattr(self, "btn_regulate"):
+                    self.btn_regulate.setText(f"✓ Regulating @ {disp_target}")
+                    self.btn_regulate.setStyleSheet(
+                        "QPushButton#btn_regulate { background-color: #16a34a; color: #ffffff; border: 1px solid #15803d; font-weight: 700; border-radius: 4px; padding: 4px 8px; }"
+                    )
+                    QTimer.singleShot(1500, self._restore_regulate_btn_style)
 
     def request_state_change(self, bypass_confirm=False):
         target_state = self.current_selected_state_key()
@@ -3032,7 +3720,8 @@ Categories=Science;Utility;
                     return
                 cycle_desc = (
                     "Current procedure will verify 3K starting temp < 3.2 K, heat charcoal to 55 K, "
-                    "condense He-3 (3.5 h), and cool charcoal to reach ~300 mK without touching the magnet."
+                    "condense He-3 (3.5 h), and cool charcoal to reach base temp (~300 mK). "
+                    "The ADR heat switch remains connected (CLOSED) to the pot, and the magnet will not be used."
                     if target_state == "he3_only_cycle" else
                     "Current procedure will verify 3K starting temp < 3.2 K, heat charcoal to 55 K, "
                     "ramp ADR to full field, condense He-3 (3.5 h), and demag."
@@ -3226,6 +3915,17 @@ Categories=Science;Utility;
                                              QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
                 if reply != QMessageBox.Yes:
                     return
+        # Safely shut off LS370 heater PID closed-loop if stopping regulation
+        try:
+            if hasattr(self, "data_thread") and self.data_thread and self.data_thread.state:
+                if self.data_thread.state.name() == "regulate_temperature":
+                    if hasattr(self, "world") and hasattr(self.world, "station") and self.world.station:
+                        if hasattr(self.world.station, "ls370") and self.world.station.ls370:
+                            self.world.station.ls370.heater.mode("off")
+                            print("[STOP] Lake Shore 370 heater mode set to 'off'.")
+        except Exception as e:
+            print(f"[STOP] Note: could not set LS370 heater mode: {e}")
+
         self.previewing_state = None
         self.dismiss_operator_banner()
         idx = self.combo_box.findData(IDLE_STATE)
@@ -3296,11 +3996,34 @@ Categories=Science;Utility;
         self.user_has_zoomed = False
         self.update_plot()
 
+    def _on_main_tab_changed(self, idx):
+        if hasattr(self, "graphs_tab") and hasattr(self, "main_tabs") and self.main_tabs.currentWidget() == self.graphs_tab:
+            self.update_plot()
+
+    def _update_readout_status_only(self):
+        """Updates metric readout cards in header without triggering expensive Matplotlib redraw."""
+        dataset = self.historical_dataset if self.displaying_historical else self.live_dataset
+        if dataset is None or not hasattr(dataset, "cache"):
+            return
+        data = dataset.cache.data()
+        data_mr = {}
+        for key in data.keys():
+            if key in data and key in data[key] and len(data[key][key]) > 0:
+                data_mr[key] = data[key][key][-1]
+        from plot_utils import get_dataset_units
+        units = get_dataset_units(dataset)
+        self._update_latest_status(data_mr, units, list(data_mr.keys()))
+
     def _on_plot_timer(self):
         self.sync_heatswitch_states_from_hardware()
         if self._drag_active:
             return
         if not self.displaying_historical:
+            # If minimized, hidden, or user is browsing another tab, update metric cards only and skip Matplotlib draw
+            is_plots_tab = hasattr(self, "main_tabs") and hasattr(self, "graphs_tab") and (self.main_tabs.currentWidget() == self.graphs_tab)
+            if self.isMinimized() or not self.isVisible() or not is_plots_tab:
+                self._update_readout_status_only()
+                return
             self.update_plot()
 
     def _find_scroll_axis_and_zone(self, event):
@@ -3511,6 +4234,8 @@ Categories=Science;Utility;
                     return f"{alias}: {val:.2f} Torr"
             if "temp" in key.lower() or str(unit).upper() == "K":
                 return f"{alias}: {format_cryo_temp(val)}"
+            if "current" in key.lower() or str(unit).upper() == "A":
+                return f"{alias}: {format_magnet_current(val)}"
             return f"{alias}: {val:.3f} {unit}".strip()
         return f"{alias}: {val}"
 
@@ -3530,6 +4255,8 @@ Categories=Science;Utility;
             "labjack_kepco_current": ["labjack_kepco_current", "kepco_current"],
         }
         for key, spec in self.metric_tiles.items():
+            if key == "relay_heater_status":
+                continue
             raw_val = None
             for candidate in key_fallbacks.get(key, [key]):
                 if candidate in data_mr:
@@ -3550,10 +4277,10 @@ Categories=Science;Utility;
                         spec["val"].setText("—")
                 elif key == "labjack_kepco_current":
                     if val is not None:
-                        spec["val"].setText(f"{val:.3f} A")
+                        spec["val"].setText(format_magnet_current(val))
                         self._latest_magnet_current = val
                     else:
-                        spec["val"].setText("0.000 A")
+                        spec["val"].setText("0.0 mA")
                         self._latest_magnet_current = 0.0
 
                 # Visual watchdogs and solid theme styling
@@ -3580,6 +4307,61 @@ Categories=Science;Utility;
                     spec["val"].setStyleSheet(val_style)
                 if "lbl_t" in spec:
                     spec["lbl_t"].setStyleSheet("color: rgba(255, 255, 255, 0.92); font-weight: 700; font-size: 11px; background: transparent;")
+
+        # Update Grey Relay State & Heater Status Card
+        if "relay_heater_status" in self.metric_tiles:
+            spec = self.metric_tiles["relay_heater_status"]
+            rel_val = None
+            if hasattr(self.world, "station") and hasattr(self.world.station, "labjack") and self.world.station.labjack:
+                try:
+                    rel_val = self.world.station.labjack.relay.cache.get()
+                except Exception:
+                    pass
+            if not rel_val or rel_val == "UNKNOWN":
+                rel_val = data_mr.get("labjack_relay")
+            if not rel_val or rel_val == "UNKNOWN":
+                rel_val = "CONTROL"
+            rel_str = str(rel_val).upper()
+
+            htr_pct = 0.0
+            if "ls370_heater_out" in data_mr and data_mr["ls370_heater_out"] is not None:
+                try:
+                    htr_pct = float(data_mr["ls370_heater_out"])
+                except Exception:
+                    pass
+
+            rc = None
+            if hasattr(self.world, "station") and hasattr(self.world.station, "ls370") and self.world.station.ls370:
+                rc = getattr(self.world.station.ls370, "heater", None)
+
+            mode_name = "Closed loop" if rel_str == "CONTROL" else "Open loop"
+            sp_disp = None
+            if rc:
+                try:
+                    m = str(rc.mode.cache.get() or "").lower()
+                    r = str(rc.range.cache.get() or "").lower()
+                    sp = rc.setpoint.cache.get()
+                    if r == "off" or r == "0":
+                        mode_name = "OFF"
+                    elif "closed" in m or m == "1":
+                        mode_name = "Closed loop"
+                    elif "open" in m or m == "0":
+                        mode_name = "Open loop"
+                    if sp is not None:
+                        sp_k = float(sp)
+                        sp_disp = f"{sp_k*1000.0:.1f} mK" if sp_k < 1.0 else f"{sp_k:.3f} K"
+                except Exception:
+                    pass
+
+            spec["lbl_t"].setText(f"RELAY STATE: {rel_str}")
+            spec["val"].setText(f"setpoint {htr_pct:.2f}% ({mode_name})")
+            card_style = "QFrame#metric_tile { background-color: #475569; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.18); }"
+            val_style = "color: #ffffff; font-weight: 700; font-size: 12px; background: transparent;"
+            spec["card"].setStyleSheet(card_style)
+            spec["val"].setStyleSheet(val_style)
+            spec["lbl_t"].setStyleSheet("color: rgba(255, 255, 255, 0.92); font-weight: 700; font-size: 11px; background: transparent;")
+            if hasattr(self, "lbl_relay_mode_status"):
+                self.lbl_relay_mode_status.setText(f"State: {rel_str}")
 
         shown_keys = [k for k in PRIMARY_STATUS_KEYS if k in data_mr]
         other_keys = [k for k in keys if k in data_mr and k not in PRIMARY_STATUS_KEYS and k not in ("time", "elapsed_time")]

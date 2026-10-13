@@ -428,7 +428,7 @@ def get_time_vector(dataset, data):
 
     # 1. Top-level 'time' parameter
     if "time" in data and "time" in data["time"] and len(data["time"]["time"]) > 0:
-        raw_t = np.array(data["time"]["time"], dtype=float)
+        raw_t = np.asarray(data["time"]["time"], dtype=float)
 
     # 2. Check setpoints across any parameter inner dict
     if raw_t is None or len(raw_t) == 0:
@@ -443,10 +443,10 @@ def get_time_vector(dataset, data):
 
         for key, inner in data.items():
             if "time" in inner and len(inner["time"]) > 0:
-                raw_t = np.array(inner["time"], dtype=float)
+                raw_t = np.asarray(inner["time"], dtype=float)
                 break
             elif "elapsed_time" in inner and len(inner["elapsed_time"]) > 0:
-                elapsed = np.array(inner["elapsed_time"], dtype=float)
+                elapsed = np.asarray(inner["elapsed_time"], dtype=float)
                 if start_ts is not None:
                     raw_t = start_ts + elapsed
                 else:
@@ -571,6 +571,19 @@ def format_cryo_temp(val):
         return f"{val:.3f} K"
     else:
         return f"{val:.1f} K"
+
+def format_magnet_current(val):
+    """
+    Format magnet current into human-readable units:
+    - Below 1.0 A: auto-scale to mA (e.g. 19.3 mA, -14.2 mA)
+    - 1.0 A and above: 3 decimal places in A (e.g. 9.454 A)
+    """
+    if val is None or not np.isfinite(val):
+        return "0.0 mA"
+    if abs(val) < 1.0:
+        return f"{val * 1000.0:.1f} mA"
+    else:
+        return f"{val:.3f} A"
 
 def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale="log",
                  time_window="All Time", theme="light", custom_xlim=None, hidden_channels=None):
@@ -745,7 +758,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             if he3_key in lines_dict:
                 line_he3 = lines_dict[he3_key]
                 if he3_key in data and he3_key in data[he3_key] and len(data[he3_key][he3_key]) > 0:
-                    v_he3 = np.array(data[he3_key][he3_key], dtype=float)
+                    v_he3 = np.asarray(data[he3_key][he3_key], dtype=float)
                     xp, vp = get_plot_arrays(x_plot, get_sliced(v_he3))
                     line_he3.set_data(xp, vp)
                     if custom_xlim is None:
@@ -762,7 +775,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             if kepco_key in lines_dict:
                 line_k = lines_dict[kepco_key]
                 if kepco_key in data and kepco_key in data[kepco_key] and len(data[kepco_key][kepco_key]) > 0:
-                    v_k = np.array(data[kepco_key][kepco_key], dtype=float)
+                    v_k = np.asarray(data[kepco_key][kepco_key], dtype=float)
                     xp, vp = get_plot_arrays(x_plot, get_sliced(v_k))
                     line_k.set_data(xp, vp)
                     if custom_xlim is None:
@@ -846,7 +859,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             if he3_key in lines_dict:
                 line_he3 = lines_dict[he3_key]
                 if he3_key in data and he3_key in data[he3_key] and len(data[he3_key][he3_key]) > 0:
-                    v_he3 = np.array(data[he3_key][he3_key], dtype=float)
+                    v_he3 = np.asarray(data[he3_key][he3_key], dtype=float)
                     xp, vp = get_plot_arrays(x_plot, get_sliced(v_he3))
                     line_he3.set_data(xp, vp)
                     if custom_xlim is None:
@@ -861,7 +874,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             if vac_key in lines_dict:
                 line_vac = lines_dict[vac_key]
                 if vac_key in data and vac_key in data[vac_key] and len(data[vac_key][vac_key]) > 0:
-                    v_vac = np.array(data[vac_key][vac_key], dtype=float)
+                    v_vac = np.asarray(data[vac_key][vac_key], dtype=float)
                     xp, vp = get_plot_arrays(x_plot, get_sliced(v_vac))
                     line_vac.set_data(xp, vp)
                     if custom_xlim is None:
@@ -898,7 +911,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
                     line = lines_dict[ch_key]
                     ax = axes_list[idx]
                     if ch_key in data and ch_key in data[ch_key] and len(data[ch_key][ch_key]) > 0:
-                        v = np.array(data[ch_key][ch_key], dtype=float)
+                        v = np.asarray(data[ch_key][ch_key], dtype=float)
                         xp, vp = get_plot_arrays(x_plot, get_sliced(v))
                         line.set_data(xp, vp)
                         if custom_xlim is None:
@@ -1009,7 +1022,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         ax_he3.yaxis.set_major_formatter(FormatStrFormatter('%.1f'))
         color_he3 = ch_colors.get(he3_key, "#2563eb")
         if he3_key in data and he3_key in data[he3_key] and len(data[he3_key][he3_key]) > 0:
-            v = np.array(data[he3_key][he3_key], dtype=float)
+            v = np.asarray(data[he3_key][he3_key], dtype=float)
             xp, vp = get_plot_arrays(x_plot, get_sliced(v))
             line_he3, = ax_he3.plot(xp, vp, color=color_he3, lw=1.8)
         else:
@@ -1025,7 +1038,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         color_kepco = ch_colors.get(kepco_key, "#0891b2")
         unit = units.get(kepco_key, "A")
         if kepco_key in data and kepco_key in data[kepco_key] and len(data[kepco_key][kepco_key]) > 0:
-            v = np.array(data[kepco_key][kepco_key], dtype=float)
+            v = np.asarray(data[kepco_key][kepco_key], dtype=float)
             xp, vp = get_plot_arrays(x_plot, get_sliced(v))
             line_k, = ax_kepco_i.plot(xp, vp, color=color_kepco, lw=1.8)
         else:
@@ -1175,7 +1188,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         name_he3 = display_name(he3_key)
         ax1.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
         if he3_key in data and he3_key in data[he3_key] and len(data[he3_key][he3_key]) > 0:
-            v_he3 = np.array(data[he3_key][he3_key], dtype=float)
+            v_he3 = np.asarray(data[he3_key][he3_key], dtype=float)
             xp, vp = get_plot_arrays(x_plot, get_sliced(v_he3))
             line_he3, = ax1.plot(xp, vp, color=color_he3, lw=1.8)
         else:
@@ -1192,7 +1205,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
         ax2.set_yscale("log")
         has_vac = False
         if vac_key in data and vac_key in data[vac_key] and len(data[vac_key][vac_key]) > 0:
-            v_vac = np.array(data[vac_key][vac_key], dtype=float)
+            v_vac = np.asarray(data[vac_key][vac_key], dtype=float)
             xp, vp = get_plot_arrays(x_plot, get_sliced(v_vac))
             valid_mask = np.isfinite(vp) & (vp > 0)
             if np.any(valid_mask):
@@ -1287,7 +1300,7 @@ def plot_dataset(figure, dataset, xloc_mouse=None, filter_tab="Main", temp_scale
             name = display_name(ch_key)
             
             if ch_key in data and ch_key in data[ch_key] and len(data[ch_key][ch_key]) > 0:
-                v = np.array(data[ch_key][ch_key], dtype=float)
+                v = np.asarray(data[ch_key][ch_key], dtype=float)
                 xp, vp = get_plot_arrays(x_plot, get_sliced(v))
                 line, = ax.plot(xp, vp, color=color, linewidth=1.8)
             else:

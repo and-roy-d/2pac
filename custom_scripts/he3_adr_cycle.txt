@@ -2,21 +2,33 @@
 # 0. Close green valve check
 print("CLOSE THE GREEN HE3 VALVE")
 
-# 1. Close heatswitches pot & adr, open charcoal, wait until 3K starting temp < 3.2K
+# 1. Close all heatswitches in the beginning and wait 30 seconds
 close heatswitch pot
 wait 1 s
 close heatswitch adr
 wait 1 s
-open heatswitch charcoal
-wait 1 s
+close heatswitch charcoal
+wait 30 s
 
+# Pre-cooling check: wait until 3K starting temp < 3.2K
 while True:
     mr = most_recent_measurements()
     if mr.get("cryocon_chC_temperature", 100) < 3.2:
         break
     world.wait(1)
 
-# 2. Start heating charcoal
+# 2. Switch relay to RAMP and ensure current starts from zero
+set relay RAMP
+wait 1 s
+ramp_controller = world.station.ls370.heater
+ramp_controller.mode('open_loop')
+ramp_controller.out(0.0)
+ramp_controller.range("100uA")
+wait 1 s
+
+# 3. Open charcoal heatswitch and start heating charcoal
+open heatswitch charcoal
+wait 1 s
 world.station.cryocon.loop1_source("A")
 world.wait(1)
 world.station.cryocon.loop1_setpoint(65)
@@ -30,14 +42,7 @@ world.wait(1)
 world.station.cryocon.control_enabled(True)
 world.wait(1)
 
-# 3. Ramp up ADR
-set relay RAMP
-world.wait(1)
-ramp_controller = world.station.ls370.heater
-ramp_controller.mode('open_loop')
-world.wait(1)
-ramp_controller.range("100uA")
-world.wait(1)
+# 4. Ramp up ADR magnet from zero
 
 target_hout = 58.1
 target_time_s = 2700 # 45 min

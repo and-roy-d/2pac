@@ -13,7 +13,16 @@ class LabjackU3(qcodes.Instrument):
         # thread (analog reads) and the GUI heat-switch thread (relay pulses)
         # share one handle; unsynchronized access can corrupt a transaction.
         self._io_lock = threading.RLock()
-        self.lj = u3.U3() # Opens first found u3 over USB
+        lj_dev = None
+        for attempt in range(5):
+            try:
+                lj_dev = u3.U3() # Opens first found u3 over USB
+                break
+            except Exception:
+                time.sleep(0.5)
+        if lj_dev is None:
+            lj_dev = u3.U3()
+        self.lj = lj_dev
 
         self.add_parameter("relay",
                            set_cmd=self.set_relay,
@@ -98,22 +107,22 @@ class LabjackU3(qcodes.Instrument):
                 print('Error: Not a channel')
 
     def setRelayControl(self, io_channel):
-        '''Turn on digital io channel for 2 seconds then turn back off to switch latching relay '''
-        
+        '''Turn on digital io channel for 1 second then turn back off to switch latching relay '''
         with self._io_lock:
+            mode_str = "RAMP (CIO0 / Pin 16)" if io_channel == 16 else ("CONTROL (CIO2 / Pin 18)" if io_channel == 18 else f"channel {io_channel}")
+            print(f"[LabJack U3] Pulsing latching relay -> {mode_str} HIGH for 1.0s...")
             self.setDigIOState(io_channel=io_channel, state='high')
-            time.sleep(0.2)
+            time.sleep(1.0)
             self.setDigIOState(io_channel=io_channel, state='low')
+            print(f"[LabJack U3] Latching relay pulse finished ({mode_str} now LOW).")
             time.sleep(0.5)
         
     def setRelayToRamp(self, io_channel=16):
-        '''Switch relay to ramp mode. Default assumes ramp setting is on io=4.'''
-        
+        '''Switch relay to ramp mode (CIO0 / channel 16).'''
         self.setRelayControl(io_channel)
         
     def setRelayToControl(self, io_channel=18):
-        '''Switch relay to control mode. Default assumes control setting is on io=5.'''
-        
+        '''Switch relay to control mode (CIO2 / channel 18).'''
         self.setRelayControl(io_channel)
 
     def setDigIOState(self, io_channel, state):
@@ -121,9 +130,9 @@ class LabjackU3(qcodes.Instrument):
         
         with self._io_lock:
             if state == 'high':
-                self.lj.getFeedback(u3.BitStateWrite(io_channel, 1))   # Set IO channel to high
+                self.lj.getFeedback(u3.BitDirWrite(io_channel, 1), u3.BitStateWrite(io_channel, 1))
             elif state == 'low':
-                self.lj.getFeedback(u3.BitStateWrite(io_channel, 0))   # Set IO channel to low
+                self.lj.getFeedback(u3.BitDirWrite(io_channel, 1), u3.BitStateWrite(io_channel, 0))
             else:
                 print('Error: Direction not valid')
 
@@ -152,12 +161,18 @@ class LabjackU3(qcodes.Instrument):
             self.pulse_digital_state(10)
         elif x=="UNKNOWN":
             pass
-
-
-
-
-
-
+        else:
+            raise ValueError(x)
+        
+    def _charcoal_hs_control(self, x):
+        if x == "OPEN":
+            self.pulse_digital_state(19)
+        elif x == "CLOSED":
+            self.pulse_digital_state(17)
+        elif x == "UNKNOWN":
+            pass
+        else:
+            raise ValueError(x)
 
 
 

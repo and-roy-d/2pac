@@ -23,7 +23,7 @@ wait 1 s
 ramp_controller = world.station.ls370.heater
 ramp_controller.mode('open_loop')
 ramp_controller.out(0.0)
-ramp_controller.range("100uA")
+ramp_controller.range("10mA")
 wait 1 s
 
 # 3. Open charcoal heatswitch and start heating charcoal
@@ -93,6 +93,6 @@ ramp_controller.mode('closed')
 world.wait(1)
 ramp_controller.setpoint(0.05)
 world.wait(1)
-ramp_controller.range("100uA")
+ramp_controller.range("10mA")
 
 return wait_forever

@@ -489,7 +489,7 @@ def start_adr_cycle(world:StationWorld):
     world.station.labjack.relay("RAMP")
     ramp_control = world.station.ls370.heater
     ramp_control.mode('open_loop')
-    ramp_control.range("100uA")
+    ramp_control.range("10mA")
     n_steps = 1200
     ramp_out = np.linspace(0, 5,n_steps, endpoint=True)
     for v_out in ramp_out:

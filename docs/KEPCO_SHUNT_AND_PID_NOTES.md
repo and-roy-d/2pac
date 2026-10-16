@@ -27,14 +27,17 @@ The Lake Shore 370 heater output is a **programmable DC current source** ($I$), 
 
 ---
 
-### 2PAC Current State (Without Parallel Shunt — As of 2026-10-15)
-* **Physical Circuit**: The Lake Shore output connects directly into the Kepco programming terminals **without** an external $100\ \Omega$ parallel shunt resistor.
-* **Kepco Internal Programming Input Impedance ($10\text{ k}\Omega$)**:
+### 2PAC Status (Updated 2026-10-16 — 100 Ω Physical Shunt Installed)
+* **Physical Circuit**: The **$100\ \Omega$ parallel shunt resistor** is now installed across the Kepco BOP 10-10M programming input terminals.
+* **Lake Shore Resistance**: Lake Shore 370 knows the heater resistance is **$100\ \Omega$** (`CSET` resistance parameter = $100.0\ \Omega$).
+* **Kepco Model**: **Kepco BOP 10-10M** ($\pm 10\text{ V}, \pm 10\text{ A}$).
+* **Operating Current Ranges**:
+  * **`RAMP` mode**: **`10mA`** range (`HTRRNG 6`). $58.1\%$ output ($5.81\text{ mA} \times 100\ \Omega = 0.581\text{ V}$) commands $9.5\text{ A}$ magnet ramp.
+  * **`CONTROL` mode**: **`10mA`** range (`HTRRNG 6`, limit code 6) or **`3.16mA`** range (`HTRRNG 5`) for regulation at $50\text{--}70\text{ mK}$.
+* **Background & Impedance Math**:
   * Standard Kepco programmable supplies use a **$10\text{ k}\Omega$ internal input resistance** on their voltage programming input ($1\text{ k}\Omega/\text{V}$, $0\text{--}10\text{ V}$ / $0\text{--}1\text{ mA}$ bridge).
-  * Without the $100\ \Omega$ external shunt in parallel, the Lake Shore 370 current source drives directly into this **$10\text{ k}\Omega$ internal input impedance**:
-    $$V_\text{prog} = I_\text{LS370} \times R_\text{in, Kepco} = 58.1\ \mu\text{A} \times 10\text{ k}\Omega = \mathbf{0.581\text{ V}}$$
-  * When KPAC adds a **$100\ \Omega$ shunt in parallel** ($100\ \Omega \parallel 10\text{ k}\Omega \approx 99\ \Omega$), the input impedance drops by a factor of **$\frac{10{,}000\ \Omega}{100\ \Omega} = 100\times$**.
-  * That is why KPAC needs **$100\times$ more current** (`10mA` range: $5.81\text{ mA} \times 100\ \Omega = 0.581\text{ V}$) to generate the exact same programming voltage that 2PAC gets on the **`100uA` range** ($58.1\ \mu\text{A} \times 10\text{ k}\Omega = 0.581\text{ V}$)!
+  * With the **$100\ \Omega$ shunt in parallel** ($100\ \Omega \parallel 10\text{ k}\Omega \approx 99\ \Omega$), the input impedance is lowered by $100\times$.
+  * Therefore, the Lake Shore 370 output current ranges are shifted up by $100\times$ (`100uA` $\rightarrow$ `10mA`), generating identical programming voltages.
 * **Why `Kepco V` Rises Linearly to $\sim 1.1\text{ V}$ During the Ramp (10/14 09:17 Log)**:
   * The `Kepco V` telemetry channel (`labjack_kepco_voltage`) monitors the **Kepco high-current output terminals** across the magnet leads, where:
     $$V_\text{Kepco, out} = I_\text{mag} \cdot R_\text{leads} + L_\text{mag} \frac{dI_\text{mag}}{dt}$$

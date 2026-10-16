@@ -147,8 +147,8 @@ DEFAULT_GUI_SETTINGS = {
         "d": 0.0,
         "heater_resistance": 100.0,
         "channel": 4,
-        "heater_limit": 4,
-        "heater_range": "100uA",
+        "heater_limit": 6,
+        "heater_range": "10mA",
         "ramp_enable": False,
         "ramp_rate_mk_min": 10.0,
     }
@@ -2497,8 +2497,8 @@ class MyApp(QWidget):
         pid_grid.addWidget(QLabel("Excitation Range:"), 3, 4)
         self.combo_pid_range = QComboBox()
         self.combo_pid_range.addItems(["off", "31.6uA", "100uA", "316uA", "1mA", "3.16mA", "10mA", "31.6mA", "100mA"])
-        self.combo_pid_range.setCurrentText(str(pid_cfg.get("heater_range", "100uA")))
-        self.combo_pid_range.setToolTip("Lake Shore 370 heater excitation output range (HTRRNG). Default: 100uA.")
+        self.combo_pid_range.setCurrentText(str(pid_cfg.get("heater_range", "10mA")))
+        self.combo_pid_range.setToolTip("Lake Shore 370 heater excitation output range (HTRRNG). Default: 10mA (with 100Ω Kepco shunt).")
         pid_grid.addWidget(self.combo_pid_range, 3, 5)
 
         pid_main_layout.addLayout(pid_grid)
@@ -2836,13 +2836,13 @@ class MyApp(QWidget):
         self.spin_pid_d.setValue(0.0)
         self.spin_pid_r.setValue(100.0)
         self.spin_pid_channel.setValue(4)
-        idx = self.combo_pid_limit.findData(4)
+        idx = self.combo_pid_limit.findData(6)
         if idx >= 0:
             self.combo_pid_limit.setCurrentIndex(idx)
-        self.combo_pid_range.setCurrentText("100uA")
+        self.combo_pid_range.setCurrentText("10mA")
         self.chk_pid_ramp_enable.setChecked(False)
         self.spin_pid_ramp_rate.setValue(10.0)
-        self.lbl_pid_status.setText("Reset to recommended FAA sub-Kelvin defaults (P=0.05, I=12s, R=100Ω). Click 'Update & Apply Settings' to write to instrument.")
+        self.lbl_pid_status.setText("Reset to recommended FAA sub-Kelvin defaults with 100Ω shunt (P=0.05, I=12s, R=100Ω, 10mA). Click 'Update & Apply Settings' to write to instrument.")
 
     def _on_log_interval_changed(self, val):
         self.world.target_tick_rate_s = float(val)
@@ -3561,7 +3561,7 @@ Categories=Science;Utility;
                             if is_reg or is_closed:
                                 if not is_closed:
                                     try:
-                                        st.ls370.write("CSET 4, 1, 1, 1, 1, 4, 100")
+                                        st.ls370.write("CSET 4, 1, 1, 1, 1, 6, 100")
                                         st.ls370.write("PID 0.05, 12, 0")
                                         st.ls370.write("SCAN 4, 0")
                                     except Exception as ce:
@@ -3576,8 +3576,13 @@ Categories=Science;Utility;
                                     print(f"[HOT UPDATE] Direct SETP write warning: {we}")
                                 if hasattr(rc, "setpoint") and hasattr(rc.setpoint, "cache"):
                                     rc.setpoint.cache.set(target_k)
-                                rc.range("100uA")
-                                print(f"[HOT UPDATE] LS370 closed-loop setpoint hot-updated to {target_k:.4f} K ({disp_target})")
+                                reg_range = "10mA"
+                                if hasattr(self, "combo_pid_range"):
+                                    txt = str(self.combo_pid_range.currentText())
+                                    if txt and txt != "off":
+                                        reg_range = txt
+                                rc.range(reg_range)
+                                print(f"[HOT UPDATE] LS370 closed-loop setpoint hot-updated to {target_k:.4f} K ({disp_target}), range={reg_range}")
                         except Exception as e:
                             print(f"[HOT UPDATE] LS370 setpoint update error: {e}")
 

@@ -19,14 +19,5 @@ more
 
 * zooming plots should work better. scroll wheel on x should zoom x and same on y. dragging with left click should drag plots.
 * plots should occupy more of the window and have less whitespace around.
-* update plots every second.
-* handle time properly on x axis, dont show seconds.
-* dont add value of the channels to legend and to the title.
-* app takes long to launch
-* ability to pin gui launcher to the sidebar
-* the normal user only wants to go from wait_forever to ready_for_cooldown to start_he3_cycle to wait_forever and then warm up (which isn't included here). I think we should have a simple mode where we dont expose the scripting and a toggle for expert mode where the scripting comes in.
-    * also we dont want to see the functions with underscores. the states should be plaintext that the user can select
-    * app should be very robust for general user.
-* there should be a utils tab where we can set a few things
-    * logging interval
+
 

@@ -37,7 +37,7 @@ world.wait(1)
 ramp_controller = world.station.ls370.heater
 ramp_controller.mode('open_loop')
 world.wait(1)
-ramp_controller.range("100uA")
+ramp_controller.range("10mA")
 world.wait(1)
 
 target_hout = 58.1
@@ -89,7 +89,7 @@ ramp_controller.mode('closed')
 world.wait(1)
 ramp_controller.setpoint(0.05)
 world.wait(1)
-ramp_controller.range("100uA")
+ramp_controller.range("10mA")
 
 return wait_forever
 """,

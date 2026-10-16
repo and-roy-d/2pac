@@ -330,7 +330,7 @@ def he3_adr_cycle(world: StationWorld):
     world.wait(1)
     ramp_controller.out(0.0)
     world.wait(1)
-    ramp_controller.range("100uA")
+    ramp_controller.range("10mA")
     world.wait(1)
 
     # 3. Open charcoal heatswitch and start heating sorption charcoal
@@ -660,7 +660,7 @@ def regulate_temperature(world: StationWorld):
     """
     Engage closed-loop PID temperature regulation on the Lake Shore 370 in CONTROL mode.
     Regulates stage temperature via physical stage heater resistor (relay switches to CONTROL).
-    Applies tuning: P=0.05, I=12, D=0, R=100 Ohm, 100uA range.
+    Applies tuning with 100 Ohm Kepco shunt: P=0.05, I=12, D=0, R=100 Ohm, 10mA range.
     Holds indefinitely in this state and continuously checks for setpoint updates.
     """
     check_magnet_deenergized(world)
@@ -707,8 +707,8 @@ def regulate_temperature(world: StationWorld):
     d_val = float(pid_cfg.get("d", 0.0))
     r_val = float(pid_cfg.get("heater_resistance", 100.0))
     ch_val = int(pid_cfg.get("channel", 4))
-    limit_val = int(pid_cfg.get("heater_limit", 4))
-    htr_range = str(pid_cfg.get("heater_range", "100uA"))
+    limit_val = int(pid_cfg.get("heater_limit", 6))
+    htr_range = str(pid_cfg.get("heater_range", "10mA"))
     ramp_en = 1 if pid_cfg.get("ramp_enable", False) else 0
     ramp_k = float(pid_cfg.get("ramp_rate_mk_min", 10.0)) / 1000.0
 
@@ -764,7 +764,7 @@ def regulate_temperature(world: StationWorld):
         try:
             rc.range(htr_range)
         except Exception:
-            rc.range("100uA")
+            rc.range("10mA")
 
     last_applied_sp = target_k
     world.set_phase(f"Regulating @ {disp_target}", 1, 1)

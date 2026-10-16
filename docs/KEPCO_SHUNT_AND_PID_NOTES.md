@@ -30,6 +30,18 @@ The Lake Shore 370 heater output is a **programmable DC current source** ($I$), 
 ### 2PAC Current State (Without Parallel Shunt — As of 2026-10-15)
 * **Physical Circuit**: The Lake Shore output connects directly into the Kepco programming terminals **without** a parallel shunt resistor.
 * **Input Impedance**: The Kepco current-mode input behaves as an inverting op-amp summing junction (virtual ground) with an effective impedance of **$R_\text{in} \le 1\ \Omega$**.
+* **Direct Current Injection Ramp**:
+  * Range: **`100uA`** (`HTRRNG 2`)
+  * Target Output: **`58.1%`** produces **$9.5\text{ A}$** in the magnet.
+  * Injected Control Current: $0.581 \times 100\ \mu\text{A} = \mathbf{58.1\ \mu\text{A}}$.
+  * Effective Current Gain: $\frac{9.5\text{ A}}{58.1\ \mu\text{A}} \approx 163{,}500\text{ A / A}$ ($6.1\ \mu\text{A}$ per Ampere of magnet current).
+  * **Why the voltage is near-zero**: Because the op-amp summing junction is at virtual ground ($0\text{ V}$), the terminal voltage is practically zero ($\sim \mu\text{V}$). 2PAC is currently operating in **direct current-injection programming**, not voltage programming!
+* **The Exact Factor of 100 Range Shift**:
+  * **KPAC**: Full scale $\approx 17.5\text{ A}$ on the **`10mA` range** (uses $100\ \Omega$ shunt).
+  * **2PAC**: Full scale $\approx 16.35\text{ A}$ on the **`100uA` range** (no shunt, direct virtual ground).
+  * The ratio of the two ranges is exactly:
+    $$\frac{10\text{ mA}}{100\ \mu\text{A}} = \mathbf{100\times}$$
+  * Adding the $100\ \Omega$ shunt on KPAC diverted $99\%$ of the current into the resistor to generate a clean $0\dots 1\text{ V}$ voltage signal, dropping the magnet control sensitivity by exactly $100\times$ for vastly superior noise immunity.
 * **The 100 Ω vs 1 Ω Software Mismatch**:
   * Previously, the software (`CSET`) was configured for `100.0 Ω` load resistance.
   * Because the physical load was actually $\le 1\ \Omega$, the Lake Shore's internal loop calculations (power scaling, compliance modeling, and gain) were off by $100\times$.
@@ -86,3 +98,4 @@ When you physically insert the $100\ \Omega$ resistor in parallel across the Kep
      ls.write(f"CSET {ch_val}, 1, 1, 1, 1, {limit_val}, 100.0")
      ```
 5. **Verify with Low Setpoint First**: Test with a small setpoint step ($1\text{ to }2\text{ mK}$ or low magnet current) to confirm stable closed-loop response before running a full cycle.
+

@@ -67,3 +67,8 @@
 | **Magnet Safety Guard** | $|I_{mag}| > 0.2\text{ A}$ | Rejects starting Cooldown, He-3 cycle, or Warmup until magnet is ramped down. |
 | **LabJack Thread Lock** | Concurrent USB access | Serialized via `threading.RLock()` to prevent relay/analog command collisions. |
 | **Vacuum Gauge Calibration** | Kurt Lesker Pirani AIN3 | Continuous log-scale monitoring: $P = 10^{(V - 5)}\text{ Torr}$. |
+
+---
+
+## Hardware & Shunt Configuration References
+* See [KEPCO_SHUNT_AND_PID_NOTES.md](file:///home/pcuser/qsp/src/2pac/docs/KEPCO_SHUNT_AND_PID_NOTES.md) for detailed hardware notes on the Kepco $100\ \Omega$ parallel shunt resistor, Lake Shore 370 current range scaling, and PID configuration differences between 2PAC and KPAC.

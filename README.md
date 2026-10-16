@@ -329,7 +329,8 @@ Each line contains: `<epoch_timestamp> <value>\n`.
 │
 ├── docs/                       # Detailed documentation
 │   ├── ARCHITECTURE.md         # Software architecture and subsystem breakdown
-│   └── PROCEDURES.md           # Operational procedure guides and safety rules
+│   ├── PROCEDURES.md           # Operational procedure guides and safety rules
+│   └── KEPCO_SHUNT_AND_PID_NOTES.md # Kepco 100 Ohm shunt resistor & PID notes
 │
 └── older/                      # Archived legacy implementations (historical reference)
     ├── README.md               # Summary of archived legacy code

@@ -4173,6 +4173,8 @@ Categories=Science;Utility;
                 ax.set_ylim(new_ylim)
 
         self.user_has_zoomed = True
+        if zoom_x:
+            self._update_faa_card_rms_title()
         self.canvas.draw_idle()
         if hasattr(self, "_zoom_update_timer"):
             self._zoom_update_timer.start(25)
@@ -4214,9 +4216,95 @@ Categories=Science;Utility;
                         new_ylim = (y_min0 - shift_y, y_max0 - shift_y)
                     ax.set_ylim(new_ylim)
 
+                    self._update_faa_card_rms_title()
                     self.canvas.draw_idle()
 
         self._update_cursor_status()
+
+    def _compute_faa_window_rms_uk(self):
+        """Compute FAA temperature RMS (standard deviation around mean, in uK) for the currently displayed time window."""
+        dataset = self.historical_dataset if self.displaying_historical else self.live_dataset
+        if dataset is None or not hasattr(dataset, "cache"):
+            return None
+        try:
+            data = dataset.cache.data()
+            if not data or "time" not in data or "time" not in data["time"]:
+                return None
+            t = data["time"]["time"]
+            if len(t) < 2:
+                return None
+
+            faa_arr = None
+            for k in ("faa_temperature", "faa"):
+                if k in data and k in data[k] and len(data[k][k]) > 0:
+                    faa_arr = data[k][k]
+                    break
+            if faa_arr is None or len(faa_arr) < 2:
+                return None
+
+            n = min(len(t), len(faa_arr))
+            t = np.asarray(t[:n], dtype=float)
+            faa_arr = np.asarray(faa_arr[:n], dtype=float)
+
+            x0, x1 = None, None
+            if self.user_has_zoomed and self.axes_list:
+                try:
+                    xlim = self.axes_list[0].get_xlim()
+                    if xlim[0] < xlim[1]:
+                        x0, x1 = float(xlim[0]), float(xlim[1])
+                except Exception:
+                    pass
+
+            if x0 is None or x1 is None:
+                tw_str = str(self.time_window or "6 Hours").lower()
+                if self.displaying_historical or "all" in tw_str:
+                    x0, x1 = float(t[0]), float(t[-1])
+                else:
+                    if "15" in tw_str or "min" in tw_str:
+                        window_s = 900.0
+                    elif "1" in tw_str and "hour" in tw_str:
+                        window_s = 3600.0
+                    elif "6" in tw_str and "hour" in tw_str:
+                        window_s = 21600.0
+                    elif "7" in tw_str and "day" in tw_str:
+                        window_s = 7.0 * 86400.0
+                    elif "24" in tw_str or "day" in tw_str:
+                        window_s = 86400.0
+                    else:
+                        window_s = 21600.0
+                    x1 = float(t[-1])
+                    x0 = x1 - window_s
+
+            i0 = int(np.searchsorted(t, x0, side="left"))
+            i1 = int(np.searchsorted(t, x1, side="right"))
+            if i1 - i0 < 2:
+                return None
+
+            sub = faa_arr[i0:i1]
+            valid = sub[np.isfinite(sub) & (sub > 0)]
+            if len(valid) < 2:
+                return None
+
+            return float(np.std(valid)) * 1e6
+        except Exception:
+            return None
+
+    def _update_faa_card_rms_title(self, control_engaged=None):
+        """Update the FAA STAGE metric card title with (xx.x uK rms) when control is engaged."""
+        if "faa_temperature" not in self.metric_tiles:
+            return
+        faa_spec = self.metric_tiles["faa_temperature"]
+        if control_engaged is None:
+            control_engaged = getattr(self, "_last_control_engaged", False)
+        else:
+            self._last_control_engaged = bool(control_engaged)
+
+        if control_engaged:
+            rms_uk = self._compute_faa_window_rms_uk()
+            if rms_uk is not None and np.isfinite(rms_uk):
+                faa_spec["lbl_t"].setText(f"FAA STAGE ({rms_uk:.1f} uK rms)")
+                return
+        faa_spec["lbl_t"].setText("FAA STAGE")
 
     # ------------- Dual-Row Status Bar ---------------
     def _format_val(self, key, val, units):
@@ -4362,6 +4450,11 @@ Categories=Science;Utility;
             spec["lbl_t"].setStyleSheet("color: rgba(255, 255, 255, 0.92); font-weight: 700; font-size: 11px; background: transparent;")
             if hasattr(self, "lbl_relay_mode_status"):
                 self.lbl_relay_mode_status.setText(f"State: {rel_str}")
+
+            dt = getattr(self, "data_thread", None)
+            is_reg_state = bool(dt and getattr(dt, "state", None) and dt.state.name() == "regulate_temperature")
+            control_engaged = (rel_str == "CONTROL") and (is_reg_state or mode_name == "Closed loop" or htr_pct > 0.0)
+            self._update_faa_card_rms_title(control_engaged=control_engaged)
 
         shown_keys = [k for k in PRIMARY_STATUS_KEYS if k in data_mr]
         other_keys = [k for k in keys if k in data_mr and k not in PRIMARY_STATUS_KEYS and k not in ("time", "elapsed_time")]

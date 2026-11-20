@@ -90,8 +90,52 @@ def create_splash_pixmap(icon_path=None):
     painter.end()
     return pixmap
 
+EXIT_ALREADY_RUNNING = 3   # scripts/run_supervised.sh stops (does not restart) on this code
+_instance_lock = None
+
+
+def _acquire_single_instance_lock():
+    """
+    Only one GUI may own the instruments (two would interleave serial commands to the LS370 / Cryo-con and
+    pulse the relay independently). Holds an flock on ~/.2pac/gui.lock for the life of the process; the OS
+    releases it when the process dies, so a crash never leaves a stale lock.
+    """
+    global _instance_lock
+    import fcntl
+    import os
+    d = Path.home() / ".2pac"
+    d.mkdir(parents=True, exist_ok=True)
+    f = open(d / "gui.lock", "a+")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.seek(0)
+        return False, f.read().strip()
+    f.seek(0)
+    f.truncate()
+    f.write(f"pid {os.getpid()} since {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.flush()
+    _instance_lock = f
+    return True, ""
+
+
 def main():
     icon_path = _resolve_icon_path()
+
+    ok, holder = _acquire_single_instance_lock()
+    if not ok:
+        print(f"2PAC GUI is already running ({holder}). Not starting a second instance.")
+        try:
+            from PyQt5.QtWidgets import QMessageBox
+            _app = QApplication(sys.argv)
+            QMessageBox.information(None, "2PAC GUI already running",
+                                    f"The 2PAC GUI is already running ({holder}).\n\n"
+                                    "Only one instance may control the instruments. Switch to the open window.")
+        except Exception:
+            pass
+        sys.exit(EXIT_ALREADY_RUNNING)
+    import os
+    os.environ["PAC2_START_TIME"] = str(time.time())  # gui uses it to find the previous instance's last state
 
     # Set application identity and WM_CLASS so GNOME Shell pairs windows with 2pac_gui.desktop
     sys.argv[0] = "2pac_gui"

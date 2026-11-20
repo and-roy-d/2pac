@@ -6,6 +6,20 @@ Built on **QCoDeS**, **PyQt5**, and **Matplotlib**, 2PAC provides automated hard
 
 ---
 
+## Quick Start (daily use)
+
+- **Launch:** click the *2pac gui* icon, or run `scripts/run_supervised.sh`. It also starts automatically at login.
+  Only one GUI can run at a time; a second launch just tells you the first one is open.
+- **Crashes:** the supervisor restarts the GUI after 10 s (normal window close = stop). After a restart a running
+  regulation loop is re-adopted automatically; an interrupted cycle or ramp is **not** resumed (a banner says what
+  was running). GUI output: `~/2pac_logs/gui_stdout/`.
+- **Operating:** see [`docs/OPERATOR_RUNBOOK.md`](docs/OPERATOR_RUNBOOK.md) (banners, regulation, relay, restarts).
+- **Before a magnet cycle:** Kepco ON with its current limit above 9.5 A, green He-3 valve closed.
+- **Changing code:** run `scripts/install_git_hooks.sh` once; `git push` then runs `tests/test_state_machine.py`.
+  Don't restart the GUI while a ramp is advancing.
+
+---
+
 ## Table of Contents
 
 1. [Key Features](#key-features)
@@ -130,15 +144,13 @@ pip install -r requirements.txt
 
 ### 4. Desktop Launcher Setup
 
-To pin **2pac gui** with the Tupac logo directly to your application launcher and desktop:
-
 ```bash
-./install_desktop_icon.sh
+scripts/install_desktop_icon.sh            # add --no-autostart to skip starting at login
 ```
 
-This automatically detects your current path, configures the `.desktop` file, sets `StartupWMClass=2pac_gui`, and places shortcuts in:
-- `~/.local/share/applications/2pac_gui.desktop`
-- `~/Desktop/2pac_gui.desktop`
+Installs the menu entry (`~/.local/share/applications/2pac_gui.desktop`), a desktop shortcut and a login
+autostart entry (`~/.config/autostart/2pac_gui.desktop`). All of them run `scripts/run_supervised.sh`, which
+restarts the GUI after a crash or a telemetry-watchdog exit and stops on a normal close.
 
 You can now launch the application by clicking the icon on your desktop or application dock.
 
@@ -236,7 +248,7 @@ Supported pseudocode commands:
   - Scroll over the **Y-axis** to zoom in/out in temperature or pressure.
 - **Right-Click Drag**: Pan viewport across the timeline.
 - **Reset Zoom**: Instantly restores the full view for the active time window.
-- **Time Range Selector**: Quickly switch between `15 Mins`, `1 Hour`, `6 Hours`, `1 Day`, or `All Time`.
+- **Time Range Selector**: Quickly switch between `1 Hour`, `6 Hours`, `1 Day`, `1 Week`, or `1 Month`.
 - **Theme Toggle**: Switch between clean **Light Mode** and high-contrast **Dark Mode**.
 
 ---
@@ -288,58 +300,31 @@ Each line contains: `<epoch_timestamp> <value>\n`.
 
 ```
 2pac/
-├── main.py                     # Application entry point & hardware init
-├── gui.py                      # Modern PyQt5 graphical interface
-├── plot_utils.py               # Matplotlib interactive plotting, locators, formatters
+├── main.py                     # Entry point: single-instance lock, hardware init, window
+├── gui.py                      # Main window (MyApp) and layout
+├── gui_common.py               # Shared imports, constants, settings helpers
+├── gui_status.py               # Banners, alerts, watchdog, status tiles, restart handling
+├── gui_utils_tab.py            # Utils tab: LS370 PID/heater settings, wiring R
+├── gui_hardware.py             # Heat switch and relay controls
+├── gui_ipc.py                  # Private command channel (~/.2pac/ipc)
+├── gui_plot_interaction.py     # Mouse zoom / pan / cursor
+├── plot_utils.py               # Matplotlib plotting, locators, formatters
 ├── daily_logger.py             # SQLite daily telemetry logger, preloader, and cache
-├── states.py                   # ADR state machine procedures & StationWorld safety
-├── launch_gui.sh               # Application launch shell script
-├── pyproject.toml              # Project packaging metadata & dependencies
-├── requirements.txt            # Python dependencies list
-├── README.md                   # System documentation
+├── states.py                   # Procedures (state machine) and safety checks
+├── alerts.py                   # Optional remote alerts (webhook / ntfy)
+├── pid_autotuner.py            # PID trial runner (uses the command channel)
+├── launch_gui.sh               # Runs main.py with the project venv
 │
-├── engine/                     # State machine & procedure execution engine
-│   ├── __init__.py             # Exports World, WaitUntil, state, State, loader functions
-│   ├── world.py                # State machine execution engine & timing loop
-│   ├── imperative_statemachine.py # Coroutine-based line-by-line state machine engine
-│   └── custom_script_loader.py # Desktop pseudocode script compiler
-│
-├── instruments/                # Hardware instrument drivers and station setup
-│   ├── __init__.py             # Exports get_station, LabjackU3, Cryocon24C, LakeshoreModel370
-│   ├── station_2pac.py         # QCoDeS Station builder
-│   ├── labjacku3.py            # LabJack U3 USB driver with thread-safe RLock
-│   ├── cryocon24c.py           # Cryo-con 24C temperature controller VISA driver
-│   ├── lakeshore370.py         # Lake Shore 370 resistance bridge driver
-│   └── lakeshore370_base.py    # Lake Shore base instrument classes
-│
-├── custom_scripts/             # Plaintext procedure templates
-│   ├── he3_adr_cycle.txt       # Full He-3 condensation + ADR cycle
-│   ├── he3_only_cycle.txt      # He-3 cycle without magnet
-│   ├── ready_for_cooldown.txt  # Pre-cooling configuration
-│   ├── warmup_300K.txt         # 300 K system warm-up
-│   └── ...
-│
-├── assets/                     # Graphical assets and desktop files
-│   ├── adr_gui_icon.png        # Application desktop icon
-│   └── 2pac_gui.desktop        # Linux XDG desktop entry
-│
-├── scripts/                    # Shell scripts
-│   ├── launch_gui.sh           # Shell launcher
-│   └── install_desktop_icon.sh # Desktop shortcut installer
-│
-├── docs/                       # Detailed documentation
-│   ├── ARCHITECTURE.md         # Software architecture and subsystem breakdown
-│   ├── PROCEDURES.md           # Operational procedure guides and safety rules
-│   └── KEPCO_SHUNT_AND_PID_NOTES.md # Kepco 100 Ohm shunt resistor & PID notes
-│
-└── older/                      # Archived legacy implementations (historical reference)
-    ├── README.md               # Summary of archived legacy code
-    ├── 2pacgui_qt.py           # Original monolithic PyQt GUI
-    ├── log_data.py             # Original text-file CSV logger
-    ├── read_logs.py            # Original offline text log parser
-    ├── world_no_mpl.py         # Headless non-matplotlib runner
-    ├── nonblocking_readline.py # Legacy non-blocking stdin reader
-    └── guitodo.txt             # Original developer scratchpad
+├── engine/                     # State machine engine
+├── instruments/                # LS370, Cryo-con 24C, LabJack U3 drivers + station
+├── custom_scripts/             # Plain-text procedure templates (magnet/relay scripts are refused)
+├── assets/                     # Icon and .desktop entry
+├── scripts/
+│   ├── run_supervised.sh       # Restart-on-crash launcher (used by all launchers)
+│   ├── install_desktop_icon.sh # Menu, desktop and login-autostart entries
+│   └── install_git_hooks.sh    # pre-push hook running the tests
+├── tests/test_state_machine.py # Fake-instrument tests of the procedures
+└── docs/                       # Runbook, fix list, architecture, Kepco/PID notes, history
 ```
 
 ---

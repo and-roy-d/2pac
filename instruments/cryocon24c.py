@@ -221,4 +221,8 @@ class Cryocon24C(VisaInstrument):
             raise ValueError()
         
     def _get_control_parser(self, x):
-        return {"ON":True, "OFF":False}[x]
+        # The 24C answers "ON " / "OFF " (trailing space, seen 2026-11-20); the old exact match raised on every read.
+        v = str(x).strip().upper()
+        if v not in ("ON", "OFF"):
+            raise ValueError(f"unexpected CONTROL? reply {x!r}")
+        return v == "ON"

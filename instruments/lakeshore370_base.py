@@ -329,10 +329,47 @@ class LakeshoreBase(VisaInstrument):
         if print_connect_message:
             self.connect_message()
 
+    # Minimum spacing between serial transactions. The LS370 misses a query sent ~10 ms after a write
+    # (HTR? right after MOUT timed out on every ramp tick, POST_CYCLE_FIXES P0-1), so every transaction
+    # waits until at least this long after the previous one finished. All threads share _io_lock.
+    MIN_GAP_AFTER_WRITE_S = 0.15
+    MIN_GAP_AFTER_QUERY_S = 0.05
+    _io_ready_at = 0.0
+
+    def _wait_for_bus(self) -> None:
+        dt = self._io_ready_at - time.monotonic()
+        if dt > 0:
+            time.sleep(dt)
+
     def write_raw(self, cmd: str) -> None:
         with self._io_lock:
-            super().write_raw(cmd)
+            self._wait_for_bus()
+            try:
+                super().write_raw(cmd)
+            finally:
+                self._io_ready_at = time.monotonic() + self.MIN_GAP_AFTER_WRITE_S
+
+    LATE_REPLY_WAIT_S = 0.3
 
     def ask_raw(self, cmd: str) -> str:
         with self._io_lock:
-            return super().ask_raw(cmd)
+            self._wait_for_bus()
+            try:
+                return super().ask_raw(cmd)
+            except Exception:
+                # A reply that arrives after the timeout would otherwise be read as the answer to the NEXT
+                # query, shifting every later answer by one (e.g. FAA temperature read as heater %). Wait for
+                # it and throw it away while still holding the bus lock.
+                self._discard_input()
+                raise
+            finally:
+                self._io_ready_at = time.monotonic() + self.MIN_GAP_AFTER_QUERY_S
+
+    def _discard_input(self) -> None:
+        try:
+            time.sleep(self.LATE_REPLY_WAIT_S)
+            import pyvisa.constants as pv_const
+            self.visa_handle.flush(pv_const.VI_READ_BUF_DISCARD)
+            self.discarded_input_count = getattr(self, "discarded_input_count", 0) + 1
+        except Exception as e:  # noqa: BLE001 - never mask the original error
+            print(f"[LS370] could not clear the serial input buffer: {e}")

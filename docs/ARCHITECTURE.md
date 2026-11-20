@@ -81,13 +81,6 @@ The **2PAC ADR** software is an automated control and telemetry logging system f
 │   ├── ARCHITECTURE.md         # Software architecture and subsystem breakdown
 │   └── PROCEDURES.md           # Operational procedure guides and safety rules
 │
-└── older/                      # Archived legacy implementations (historical reference)
-    ├── README.md               # Summary of archived legacy code
-    ├── 2pacgui_qt.py           # Original monolithic PyQt GUI
-    ├── log_data.py             # Original text-file CSV logger
-    ├── read_logs.py            # Original offline text log parser
-    ├── world_no_mpl.py         # Headless non-matplotlib runner
-    └── guitodo.txt             # Original developer scratchpad
 ```
 
 ---
